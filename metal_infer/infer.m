@@ -1853,13 +1853,7 @@ static void gpu_flush_batch_results(MetalCtx *ctx, BatchMatvecSpec *specs, int n
 static inline id<MTLComputePipelineState> select_4bit_expert_matvec_pipe(
     MetalCtx *ctx, uint32_t out_dim, uint32_t in_dim, uint32_t *rows_per_tg, uint32_t *threads_per_tg
 ) {
-    // M4-specific heuristic: use 128-thread variant for gate/up style shapes
-    // (high in_dim, small out_dim), keep default v3 for down_proj.
-    if (ctx->matvec_v3_tg128 && in_dim >= 2048 && out_dim <= 1024) {
-        *rows_per_tg = 4;
-        *threads_per_tg = 128;
-        return ctx->matvec_v3_tg128;
-    }
+    // M1 Pro (14 cores): tg256 preferred — wider threadgroups exploit higher memory bandwidth.
     *rows_per_tg = 8;
     *threads_per_tg = 256;
     return ctx->matvec_v3;
@@ -5470,14 +5464,7 @@ static void fused_layer_forward(
             uint32_t threads_per_tg = 256;
             id<MTLComputePipelineState> oproj_pipe = g_metal->matvec_fast;
             if (use_v3) {
-                // M4 heuristic for full-attn o_proj (2048x2048): prefer tg128 for occupancy.
-                if (g_metal->matvec_v3_tg128 && o_in_dim >= 2048 && o_out_dim <= 2048) {
-                    rows_per_tg = 4;
-                    threads_per_tg = 128;
-                    oproj_pipe = g_metal->matvec_v3_tg128;
-                } else {
-                    oproj_pipe = g_metal->matvec_v3;
-                }
+                oproj_pipe = g_metal->matvec_v3;
             }
             [enc setComputePipelineState:oproj_pipe];
             [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
