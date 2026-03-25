@@ -6837,21 +6837,13 @@ static void serve_loop(
     }
     int sys_prompt_len = sys_pos;  // number of tokens in system prompt cache
 
-    // ---- Session state: 2-slot LRU session cache ----
+    // ---- Session state: single-slot session cache ----
     // The KV caches + linear attention state ARE the session.
     // Implicit session continuity: detect continuation by checking if the new tokenized
-    // prompt starts with the cached prompt tokens from a previous request.
-#define SERVE_MAX_SESSIONS 2
-    typedef struct {
-        uint32_t *ids;    // prompt + generated token IDs from last completed request
-        int count;         // length of ids array (== kv_pos after generation)
-        int kv_pos;        // pos after last generation (for continuation)
-        uint64_t seq;      // request sequence number for LRU eviction
-    } ServSession;
-    ServSession srv_sessions[SERVE_MAX_SESSIONS];
-    memset(srv_sessions, 0, sizeof(srv_sessions));
-    int srv_active_slot = -1;   // which slot's state is in the KV/delta buffers
-    uint64_t srv_req_seq = 0;   // monotonically increasing request counter
+    // prompt starts with the cached prompt+gen tokens from the previous completed request.
+    int session_pos = 0;        // pos after last generation
+    uint32_t *cached_prompt_ids = NULL;
+    int n_cached_prompt = 0;
 
     for (;;) {
         struct sockaddr_in client_addr;
@@ -6947,30 +6939,24 @@ static void serve_loop(
             }
 
             // ---- Implicit session continuity detection ----
-            // Find a session slot whose token prefix matches the new prompt.
-            srv_req_seq++;
-            int match_slot = -1;
-            for (int si = 0; si < SERVE_MAX_SESSIONS; si++) {
-                if (srv_sessions[si].count > 0 &&
-                    pt->count > srv_sessions[si].count &&
-                    memcmp(pt->ids, srv_sessions[si].ids,
-                           (size_t)srv_sessions[si].count * sizeof(uint32_t)) == 0) {
-                    match_slot = si;
-                    break;
-                }
+            // Continuation requires both:
+            //   1. new prompt is strictly longer than the cached token array
+            //   2. all cached tokens match the new prompt prefix exactly (memcmp)
+            int is_continuation = 0;
+            int continuation_start = 0;
+            if (n_cached_prompt > 0 && pt->count > n_cached_prompt &&
+                memcmp(pt->ids, cached_prompt_ids,
+                       (size_t)n_cached_prompt * sizeof(uint32_t)) == 0) {
+                is_continuation = 1;
+                continuation_start = n_cached_prompt;
             }
-            // True continuation only if the matching slot is also the active KV slot.
-            // If match_slot != srv_active_slot, the KV cache holds a different session's state.
-            int is_continuation = (match_slot >= 0 && match_slot == srv_active_slot);
-            int continuation_start = is_continuation ? srv_sessions[match_slot].count : 0;
-            int session_pos        = is_continuation ? srv_sessions[match_slot].kv_pos : 0;
 
             fprintf(stderr, "[serve] %s content=%zu chars, prompt=%d tokens, max_tokens=%d%s\n",
                     request_id, strlen(content), pt->count, max_gen,
                     is_continuation ? " [CONTINUATION]" : " [NEW]");
             if (is_continuation) {
                 fprintf(stderr, "[serve] %s continuation: cached=%d tokens, new_tail=%d tokens, session_pos=%d\n",
-                        request_id, srv_sessions[match_slot].count, pt->count - continuation_start, session_pos);
+                        request_id, n_cached_prompt, pt->count - continuation_start, session_pos);
             }
 
             int pos;
@@ -7012,19 +6998,9 @@ static void serve_loop(
                     reset_delta_net_state();
                 }
                 pos = 0;  // full prefill from the beginning
-                // Assign a session slot for this new request: reuse matched slot (different KV)
-                // or evict LRU slot.
-                int new_slot;
-                if (match_slot >= 0) {
-                    new_slot = match_slot;
-                } else {
-                    new_slot = 0;
-                    for (int si = 1; si < SERVE_MAX_SESSIONS; si++) {
-                        if (srv_sessions[si].seq < srv_sessions[new_slot].seq)
-                            new_slot = si;
-                    }
-                }
-                srv_active_slot = new_slot;
+                // Invalidate cache so next request doesn't misdetect continuation.
+                if (cached_prompt_ids) { free(cached_prompt_ids); cached_prompt_ids = NULL; }
+                n_cached_prompt = 0;
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
@@ -7238,28 +7214,25 @@ static void serve_loop(
 
             // ---- Save session state ----
             free(gen_response);
-            srv_sessions[srv_active_slot].kv_pos = pos;
-            srv_sessions[srv_active_slot].seq = srv_req_seq;
-            fprintf(stderr, "[serve] %s session_pos=%d slot=%d\n",
-                    request_id, pos, srv_active_slot);
+            session_pos = pos;
+            fprintf(stderr, "[serve] %s session_pos=%d\n", request_id, pos);
 
             // Save prompt + generated token IDs so next turn can detect continuation.
-            if (srv_sessions[srv_active_slot].ids) free(srv_sessions[srv_active_slot].ids);
+            if (cached_prompt_ids) free(cached_prompt_ids);
             if (client_alive && n_gen_ids > 0) {
                 size_t total = (size_t)pt->count + (size_t)n_gen_ids;
-                srv_sessions[srv_active_slot].ids = malloc(total * sizeof(uint32_t));
-                if (srv_sessions[srv_active_slot].ids) {
-                    memcpy(srv_sessions[srv_active_slot].ids, pt->ids,
-                           (size_t)pt->count * sizeof(uint32_t));
-                    memcpy(srv_sessions[srv_active_slot].ids + pt->count, gen_ids_buf,
+                cached_prompt_ids = malloc(total * sizeof(uint32_t));
+                if (cached_prompt_ids) {
+                    memcpy(cached_prompt_ids, pt->ids, (size_t)pt->count * sizeof(uint32_t));
+                    memcpy(cached_prompt_ids + pt->count, gen_ids_buf,
                            (size_t)n_gen_ids * sizeof(uint32_t));
-                    srv_sessions[srv_active_slot].count = (int)total;
+                    n_cached_prompt = (int)total;
                 } else {
-                    srv_sessions[srv_active_slot].count = 0;
+                    n_cached_prompt = 0;
                 }
             } else {
-                srv_sessions[srv_active_slot].ids = NULL;
-                srv_sessions[srv_active_slot].count = 0;
+                cached_prompt_ids = NULL;
+                n_cached_prompt = 0;
             }
             if (gen_ids_buf) { free(gen_ids_buf); gen_ids_buf = NULL; }
 
