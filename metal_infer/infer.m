@@ -6812,9 +6812,15 @@ static void serve_loop(
 
     // ---- Session state: track one active conversation session ----
     // The KV caches + linear attention state ARE the session.
-    // We just track whether to restore from snapshot (new session) or continue (same session).
+    // Implicit session continuity: detect continuation by checking if the new tokenized
+    // prompt starts with the cached prompt tokens from the previous request.
     char active_session_id[64] = {0};
     int session_pos = 0;  // RoPE position after last generation for the active session
+
+    // Cached prompt tokens for implicit continuation detection.
+    // Stores the full tokenized prompt from the most recent completed request.
+    uint32_t *cached_prompt_ids = NULL;
+    int n_cached_prompt = 0;
 
     for (;;) {
         struct sockaddr_in client_addr;
@@ -6879,151 +6885,141 @@ static void serve_loop(
             }
             body += 4;
 
-            // Extract session_id and max_tokens BEFORE content extraction
-            // (extract_last_content mutates the body buffer in place)
+            // Extract max_tokens from request
             int max_gen = extract_max_tokens(body, 8192);
             if (max_gen > 32768) max_gen = 32768;
-            char req_session_id[64] = {0};
-            int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
 
-            // Extract user content from messages (mutates body — must be last)
-            //char *content = extract_last_content(body);
-            //if (!content || strlen(content) == 0) {
-            //    http_write_str(client_fd,
-            //        "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
-            //        "{\"error\":\"no content in messages\"}\n");
-            //    free(reqbuf); close(client_fd); continue;
-            //
-            int is_continuation = (has_session &&
-                                   active_session_id[0] != '\0' &&
-                                   strcmp(req_session_id, active_session_id) == 0);
-
-            // NEW
+            // Build the full Qwen3-formatted prompt from all messages in the request.
+            // build_qwen_prompt returns a complete formatted string including all turns
+            // and the assistant turn opener, e.g.:
+            //   <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
             char *content = build_qwen_prompt(body);
             if (!content || strlen(content) == 0) {
                 http_write_str(client_fd,
                     "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"no content in messages\"}\n");
-                free(reqbuf); close(client_fd); continue;
+                free(content); free(reqbuf); close(client_fd); continue;
             }
             // content is now heap-allocated — must free() it after use
-
-            // Session persistence is handled by the client (chat.m)
 
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
 
-            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, session=%s%s\n",
-                    request_id, strlen(content), max_gen,
-                    has_session ? req_session_id : "(none)",
-                    is_continuation ? " [CONTINUE]" : " [NEW]");
-
-            // ---- Tokenize ----
-            // Continuation: prefix with <|im_end|>\n to close prior assistant turn
-            // New session: just the user turn (system prompt restored from snapshot)
-            PromptTokens *pt;
-            if (is_continuation) {
-                pt = tokenize_continuation_turn(content);
-            } else {
-                pt = tokenize_user_turn(content);
-            }
+            // ---- Tokenize the full prompt directly ----
+            // We tokenize build_qwen_prompt's output directly (no extra wrapping).
+            PromptTokens *pt = encode_prompt_text_to_tokens(content);
             if (!pt) {
                 http_write_str(client_fd,
                     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"tokenization failed\"}\n");
-                free(reqbuf); close(client_fd); continue;
+                free(content); free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens%s\n", request_id, pt->count,
-                    is_continuation ? " (continuation — skipping snapshot restore)" : "");
+            // ---- Implicit session continuity detection ----
+            // If the new prompt's tokens start with the cached tokens from the previous
+            // request, this is a continuation of the same conversation. In that case we
+            // can skip re-prefilling the shared prefix and only process the new tail.
+            // Open WebUI always sends the full conversation history, so each new turn's
+            // prompt is always the previous prompt + new messages appended.
+            int is_continuation = 0;
+            int continuation_start = 0;  // index into pt->ids where new tokens begin
+            if (n_cached_prompt > 0 && pt->count > n_cached_prompt) {
+                int match = 1;
+                for (int ci = 0; ci < n_cached_prompt; ci++) {
+                    if (pt->ids[ci] != cached_prompt_ids[ci]) {
+                        match = 0;
+                        break;
+                    }
+                }
+                if (match) {
+                    is_continuation = 1;
+                    continuation_start = n_cached_prompt;
+                }
+            }
+
+            fprintf(stderr, "[serve] %s content=%zu chars, prompt=%d tokens, max_tokens=%d%s\n",
+                    request_id, strlen(content), pt->count, max_gen,
+                    is_continuation ? " [CONTINUATION]" : " [NEW]");
+            if (is_continuation) {
+                fprintf(stderr, "[serve] %s continuation: cached=%d tokens, new_tail=%d tokens, session_pos=%d\n",
+                        request_id, n_cached_prompt, pt->count - continuation_start, session_pos);
+            }
 
             int pos;
             if (is_continuation) {
                 // ---- Continue from existing session state ----
                 // The KV caches + linear attention state already contain the full
-                // conversation history. Just set pos to where we left off.
+                // conversation history up to session_pos. Only the new tail tokens
+                // (pt->ids[continuation_start..pt->count-1]) need to be prefilled.
                 pos = session_pos;
             } else {
-                // ---- Restore state from system prompt snapshot ----
-                // Instead of resetting to zero, restore to the cached system prompt state.
-                // This skips re-prefilling the system prompt tokens (~20 tokens, ~6s saved).
+                // ---- New conversation: reset all state to zero ----
+                // Full prefill of the entire prompt from position 0.
+                // We reset all KV caches and linear attention state before prefilling,
+                // because we now tokenize the complete formatted prompt directly
+                // (including the system message), so the sys-prompt snapshot is not used.
                 for (int i = 0; i < cfg.num_layers; i++) {
-                    if (kv_caches[i] && kv_snapshots[i].k_snapshot) {
-                        size_t sz = sys_prompt_len * kv_dim * sizeof(float);
-                        memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
-                        memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
-                        kv_caches[i]->len = kv_snapshots[i].len;
-                        // Also restore GPU KV mirror
-                        if (g_metal) {
-                            int fa_idx = cfg.full_attn_index[i];
-                            if (fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
-                                memcpy([g_metal->buf_kv_k[fa_idx] contents],
-                                       kv_snapshots[i].k_snapshot, sz);
-                                memcpy([g_metal->buf_kv_v[fa_idx] contents],
-                                       kv_snapshots[i].v_snapshot, sz);
-                            }
-                        }
-                    } else if (kv_caches[i]) {
+                    if (kv_caches[i]) {
                         kv_caches[i]->len = 0;
                     }
-                    if (layer_states[i] && la_conv_snapshots[i]) {
-                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
-                        memcpy(s->conv_state, la_conv_snapshots[i], conv_state_size);
-                        memcpy(s->ssm_state, la_ssm_snapshots[i], ssm_state_size);
-                    } else if (layer_states[i]) {
+                    if (layer_states[i]) {
                         LinearAttnState *s = (LinearAttnState *)layer_states[i];
                         memset(s->conv_state, 0, conv_state_size);
                         memset(s->ssm_state, 0, ssm_state_size);
                     }
                 }
-                // Restore GPU delta-net state
+                // Reset GPU delta-net state
                 if (g_metal && g_metal->delta_net_step) {
                     for (int i = 0; i < cfg.num_linear_layers; i++) {
-                        if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
-                            memcpy([g_metal->buf_delta_state[i] contents],
-                                   gpu_delta_snapshots[i], (size_t)cfg.linear_num_v_heads*cfg.linear_value_dim*cfg.linear_key_dim*sizeof(float));
-                        if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
-                            memcpy([g_metal->buf_conv_state[i] contents],
-                                   gpu_conv_snapshots[i], (cfg.conv_kernel_size-1)*(size_t)cfg.linear_conv_dim*sizeof(float));
+                        if (g_metal->buf_delta_state[i]) {
+                            size_t delta_sz = (size_t)cfg.linear_num_v_heads*cfg.linear_value_dim*cfg.linear_key_dim*sizeof(float);
+                            memset([g_metal->buf_delta_state[i] contents], 0, delta_sz);
+                        }
+                        if (g_metal->buf_conv_state[i]) {
+                            size_t conv_sz = (cfg.conv_kernel_size-1)*(size_t)cfg.linear_conv_dim*sizeof(float);
+                            memset([g_metal->buf_conv_state[i] contents], 0, conv_sz);
+                        }
                     }
                 } else {
                     reset_delta_net_state();
                 }
-                pos = sys_prompt_len;  // start after cached system prompt
-                // Update active session
-                if (has_session) {
-                    strncpy(active_session_id, req_session_id, sizeof(active_session_id) - 1);
-                    active_session_id[sizeof(active_session_id) - 1] = '\0';
-                } else {
-                    active_session_id[0] = '\0';
-                }
+                pos = 0;  // full prefill from the beginning
+                // Invalidate cached prompt so next request doesn't misdetect continuation
+                if (cached_prompt_ids) { free(cached_prompt_ids); cached_prompt_ids = NULL; }
+                n_cached_prompt = 0;
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
             // ---- Send SSE headers ----
             http_write_str(client_fd, SSE_HEADERS);
 
-            if (sse_send_role(client_fd, request_id) < 0) { free(pt->ids); free(pt); free(reqbuf); close(client_fd); continue; }
-            if (sse_send_keepalive(client_fd) < 0) { free(pt->ids); free(pt); free(reqbuf); close(client_fd); continue; }
+            if (sse_send_role(client_fd, request_id) < 0) { free(pt->ids); free(pt); free(content); free(reqbuf); close(client_fd); continue; }
+            if (sse_send_keepalive(client_fd) < 0) { free(pt->ids); free(pt); free(content); free(reqbuf); close(client_fd); continue; }
 
             // ---- Batch prefill ----
+            // For continuations, only prefill the new tail tokens (pt->ids[continuation_start..]).
+            // For new conversations, prefill all tokens from position 0.
             double t_prefill = now_ms();
-            // Pre-embed all request tokens
+            int prefill_start = is_continuation ? continuation_start : 0;
+            int n_prefill = pt->count - prefill_start;  // number of tokens to actually prefill
+
+            // Pre-embed the tokens we need to prefill
             float *serve_embed_batch = NULL;
-            if (pt->count > 1) {
-                serve_embed_batch = malloc((size_t)pt->count * cfg.hidden_dim * sizeof(float));
-                for (int i = 0; i < pt->count; i++) {
-                    embed_lookup(wf, pt->ids[i], serve_embed_batch + (size_t)i * cfg.hidden_dim);
+            if (n_prefill > 1) {
+                serve_embed_batch = malloc((size_t)n_prefill * cfg.hidden_dim * sizeof(float));
+                for (int i = 0; i < n_prefill; i++) {
+                    embed_lookup(wf, pt->ids[prefill_start + i],
+                                 serve_embed_batch + (size_t)i * cfg.hidden_dim);
                 }
             }
             // Intermediate prefill tokens: discard last-layer expert output
-            for (int i = 0; i < pt->count - 1; i++) {
+            for (int i = 0; i < n_prefill - 1; i++) {
                 cache_telemetry_note_token();
                 if (serve_embed_batch) {
                     memcpy(hidden, serve_embed_batch + (size_t)i * cfg.hidden_dim,
                            cfg.hidden_dim * sizeof(float));
                 } else {
-                    embed_lookup(wf, pt->ids[i], hidden);
+                    embed_lookup(wf, pt->ids[prefill_start + i], hidden);
                 }
                 for (int layer = 0; layer < cfg.num_layers; layer++) {
                     int is_full = cfg.is_full_attn[layer];
@@ -7041,10 +7037,10 @@ static void serve_loop(
             {
                 cache_telemetry_note_token();
                 if (serve_embed_batch) {
-                    memcpy(hidden, serve_embed_batch + (size_t)(pt->count - 1) * cfg.hidden_dim,
+                    memcpy(hidden, serve_embed_batch + (size_t)(n_prefill - 1) * cfg.hidden_dim,
                            cfg.hidden_dim * sizeof(float));
                 } else {
-                    embed_lookup(wf, pt->ids[0], hidden);
+                    embed_lookup(wf, pt->ids[prefill_start + n_prefill - 1], hidden);
                 }
                 for (int layer = 0; layer < cfg.num_layers; layer++) {
                     int is_full = cfg.is_full_attn[layer];
@@ -7060,8 +7056,8 @@ static void serve_loop(
             }
             if (serve_embed_batch) { free(serve_embed_batch); serve_embed_batch = NULL; }
             double prefill_ms = now_ms() - t_prefill;
-            fprintf(stderr, "[serve] %s prefill=%d tokens in %.0fms\n",
-                    request_id, pt->count, prefill_ms);
+            fprintf(stderr, "[serve] %s prefill=%d tokens (of %d total) in %.0fms\n",
+                    request_id, n_prefill, pt->count, prefill_ms);
 
             // ---- Final norm + LM head for first token ----
             if (final_norm_w) {
@@ -7195,11 +7191,21 @@ static void serve_loop(
             // ---- Save session state ----
             free(gen_response);
             // The KV caches + linear attention state already contain this conversation.
-            // Just record the position so the next request can continue from here.
+            // Record the position so the next request can detect continuation.
             session_pos = pos;
-            fprintf(stderr, "[serve] %s session_pos=%d (session=%s)\n",
-                    request_id, session_pos,
-                    active_session_id[0] ? active_session_id : "(none)");
+            fprintf(stderr, "[serve] %s session_pos=%d\n", request_id, session_pos);
+
+            // Save the full tokenized prompt for implicit continuation detection.
+            // On the next request, if the new prompt's tokens start with these tokens,
+            // we know it's a continuation and can skip re-prefilling the prefix.
+            if (cached_prompt_ids) free(cached_prompt_ids);
+            cached_prompt_ids = malloc((size_t)pt->count * sizeof(uint32_t));
+            if (cached_prompt_ids) {
+                memcpy(cached_prompt_ids, pt->ids, (size_t)pt->count * sizeof(uint32_t));
+                n_cached_prompt = pt->count;
+            } else {
+                n_cached_prompt = 0;
+            }
 
             double gen_ms = now_ms() - t_gen;
             fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)\n",
@@ -7213,6 +7219,7 @@ static void serve_loop(
 
             free(pt->ids);
             free(pt);
+            free(content);
             free(reqbuf);
             close(client_fd);
             continue;
