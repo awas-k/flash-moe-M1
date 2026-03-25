@@ -7086,6 +7086,12 @@ static void serve_loop(
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
 
+            // Track generated token IDs for continuation detection.
+            // We need to store prompt + gen tokens so the next request's prefix comparison
+            // finds the correct continuation_start = session_pos (not just prompt_len).
+            uint32_t *gen_ids_buf = malloc((size_t)(max_gen + 2) * sizeof(uint32_t));
+            int n_gen_ids = 0;
+
             // Stream first token immediately after first logits are ready
             for (int gen = 0; gen < max_gen; gen++) {
                 if (next_token == prev_token) repeat_run++;
@@ -7101,6 +7107,8 @@ static void serve_loop(
                 }
 
                 if (next_token == cfg.eos_token_ids[0] || next_token == cfg.eos_token_ids[1]) {
+                    // Record EOS token before feeding it through the model
+                    if (gen_ids_buf) gen_ids_buf[n_gen_ids++] = (uint32_t)next_token;
                     // Feed EOS through the model so session state includes it
                     cache_telemetry_note_token();
                     embed_lookup(wf, next_token, hidden);
@@ -7147,6 +7155,8 @@ static void serve_loop(
                     }
                 }
 
+                // Record token ID for continuation detection
+                if (gen_ids_buf) gen_ids_buf[n_gen_ids++] = (uint32_t)next_token;
                 gen_count++;
 
                 // Generate next token
@@ -7195,17 +7205,28 @@ static void serve_loop(
             session_pos = pos;
             fprintf(stderr, "[serve] %s session_pos=%d\n", request_id, session_pos);
 
-            // Save the full tokenized prompt for implicit continuation detection.
-            // On the next request, if the new prompt's tokens start with these tokens,
-            // we know it's a continuation and can skip re-prefilling the prefix.
+            // Save prompt + generated token IDs for implicit continuation detection.
+            // The next request's prompt (from Open WebUI) will be:
+            //   [original_prompt_tokens][gen_tokens][eos_token][newline][new_user_turn...]
+            // By caching prompt+gen (= session_pos tokens total), the comparison will
+            // find continuation_start = session_pos, so we skip re-prefilling everything
+            // already in the KV cache and only process the truly new tail tokens.
             if (cached_prompt_ids) free(cached_prompt_ids);
-            cached_prompt_ids = malloc((size_t)pt->count * sizeof(uint32_t));
-            if (cached_prompt_ids) {
-                memcpy(cached_prompt_ids, pt->ids, (size_t)pt->count * sizeof(uint32_t));
-                n_cached_prompt = pt->count;
+            if (client_alive && n_gen_ids > 0) {
+                size_t total = (size_t)pt->count + (size_t)n_gen_ids;
+                cached_prompt_ids = malloc(total * sizeof(uint32_t));
+                if (cached_prompt_ids) {
+                    memcpy(cached_prompt_ids, pt->ids, (size_t)pt->count * sizeof(uint32_t));
+                    memcpy(cached_prompt_ids + pt->count, gen_ids_buf, (size_t)n_gen_ids * sizeof(uint32_t));
+                    n_cached_prompt = (int)total;
+                } else {
+                    n_cached_prompt = 0;
+                }
             } else {
+                cached_prompt_ids = NULL;
                 n_cached_prompt = 0;
             }
+            if (gen_ids_buf) { free(gen_ids_buf); gen_ids_buf = NULL; }
 
             double gen_ms = now_ms() - t_gen;
             fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)\n",
