@@ -6461,8 +6461,7 @@ static char *build_qwen_prompt(const char *buf) {
     out[0] = '\0';
     size_t out_len = 0;
     const char *p = buf;
-    // Force no_think option
-    const char *no_think_system = "<|im_start|>system\n/no_think<|im_end|>\n";
+    int has_system = 0;
     for (;;) {
         // Find next message object with a "role"
         const char *role_key = strstr(p, "\"role\"");
@@ -6519,11 +6518,39 @@ static char *build_qwen_prompt(const char *buf) {
             out = realloc(out, out_size);
             if (!out) { free(content); return NULL; }
         }
-        out_len += snprintf(out + out_len, out_size - out_len,
-                            "<|im_start|>%s\n%s<|im_end|>\n",
-                            role, content);
+        if (strcmp(role, "system") == 0) {
+            has_system = 1;
+            out_len += snprintf(out + out_len, out_size - out_len,
+                                "<|im_start|>system\n/no_think\n%s<|im_end|>\n",
+                                content);
+        } else {
+            out_len += snprintf(out + out_len, out_size - out_len,
+                                "<|im_start|>%s\n%s<|im_end|>\n",
+                                role, content);
+        }
         free(content);
         p = c;
+    }
+
+    // If no system message was in the request, inject /no_think system block.
+    if (!has_system) {
+        const char *inject = "<|im_start|>system\n/no_think<|im_end|>\n";
+        size_t inject_len = strlen(inject);
+        size_t needed = out_len + inject_len + 1;
+        if (needed > out_size) {
+            out_size = needed * 2;
+            char *tmp = malloc(out_size);
+            if (tmp) {
+                memcpy(tmp, inject, inject_len);
+                memcpy(tmp + inject_len, out, out_len + 1);
+                free(out);
+                out = tmp;
+            }
+        } else {
+            memmove(out + inject_len, out, out_len + 1);
+            memcpy(out, inject, inject_len);
+        }
+        out_len += inject_len;
     }
 
     // Append assistant turn opener
@@ -6810,17 +6837,21 @@ static void serve_loop(
     }
     int sys_prompt_len = sys_pos;  // number of tokens in system prompt cache
 
-    // ---- Session state: track one active conversation session ----
+    // ---- Session state: 2-slot LRU session cache ----
     // The KV caches + linear attention state ARE the session.
     // Implicit session continuity: detect continuation by checking if the new tokenized
-    // prompt starts with the cached prompt tokens from the previous request.
-    char active_session_id[64] = {0};
-    int session_pos = 0;  // RoPE position after last generation for the active session
-
-    // Cached prompt tokens for implicit continuation detection.
-    // Stores the full tokenized prompt from the most recent completed request.
-    uint32_t *cached_prompt_ids = NULL;
-    int n_cached_prompt = 0;
+    // prompt starts with the cached prompt tokens from a previous request.
+#define SERVE_MAX_SESSIONS 2
+    typedef struct {
+        uint32_t *ids;    // prompt + generated token IDs from last completed request
+        int count;         // length of ids array (== kv_pos after generation)
+        int kv_pos;        // pos after last generation (for continuation)
+        uint64_t seq;      // request sequence number for LRU eviction
+    } ServSession;
+    ServSession srv_sessions[SERVE_MAX_SESSIONS];
+    memset(srv_sessions, 0, sizeof(srv_sessions));
+    int srv_active_slot = -1;   // which slot's state is in the KV/delta buffers
+    uint64_t srv_req_seq = 0;   // monotonically increasing request counter
 
     for (;;) {
         struct sockaddr_in client_addr;
@@ -6916,33 +6947,30 @@ static void serve_loop(
             }
 
             // ---- Implicit session continuity detection ----
-            // If the new prompt's tokens start with the cached tokens from the previous
-            // request, this is a continuation of the same conversation. In that case we
-            // can skip re-prefilling the shared prefix and only process the new tail.
-            // Open WebUI always sends the full conversation history, so each new turn's
-            // prompt is always the previous prompt + new messages appended.
-            int is_continuation = 0;
-            int continuation_start = 0;  // index into pt->ids where new tokens begin
-            if (n_cached_prompt > 0 && pt->count > n_cached_prompt) {
-                int match = 1;
-                for (int ci = 0; ci < n_cached_prompt; ci++) {
-                    if (pt->ids[ci] != cached_prompt_ids[ci]) {
-                        match = 0;
-                        break;
-                    }
-                }
-                if (match) {
-                    is_continuation = 1;
-                    continuation_start = n_cached_prompt;
+            // Find a session slot whose token prefix matches the new prompt.
+            srv_req_seq++;
+            int match_slot = -1;
+            for (int si = 0; si < SERVE_MAX_SESSIONS; si++) {
+                if (srv_sessions[si].count > 0 &&
+                    pt->count > srv_sessions[si].count &&
+                    memcmp(pt->ids, srv_sessions[si].ids,
+                           (size_t)srv_sessions[si].count * sizeof(uint32_t)) == 0) {
+                    match_slot = si;
+                    break;
                 }
             }
+            // True continuation only if the matching slot is also the active KV slot.
+            // If match_slot != srv_active_slot, the KV cache holds a different session's state.
+            int is_continuation = (match_slot >= 0 && match_slot == srv_active_slot);
+            int continuation_start = is_continuation ? srv_sessions[match_slot].count : 0;
+            int session_pos        = is_continuation ? srv_sessions[match_slot].kv_pos : 0;
 
             fprintf(stderr, "[serve] %s content=%zu chars, prompt=%d tokens, max_tokens=%d%s\n",
                     request_id, strlen(content), pt->count, max_gen,
                     is_continuation ? " [CONTINUATION]" : " [NEW]");
             if (is_continuation) {
                 fprintf(stderr, "[serve] %s continuation: cached=%d tokens, new_tail=%d tokens, session_pos=%d\n",
-                        request_id, n_cached_prompt, pt->count - continuation_start, session_pos);
+                        request_id, srv_sessions[match_slot].count, pt->count - continuation_start, session_pos);
             }
 
             int pos;
@@ -6984,9 +7012,19 @@ static void serve_loop(
                     reset_delta_net_state();
                 }
                 pos = 0;  // full prefill from the beginning
-                // Invalidate cached prompt so next request doesn't misdetect continuation
-                if (cached_prompt_ids) { free(cached_prompt_ids); cached_prompt_ids = NULL; }
-                n_cached_prompt = 0;
+                // Assign a session slot for this new request: reuse matched slot (different KV)
+                // or evict LRU slot.
+                int new_slot;
+                if (match_slot >= 0) {
+                    new_slot = match_slot;
+                } else {
+                    new_slot = 0;
+                    for (int si = 1; si < SERVE_MAX_SESSIONS; si++) {
+                        if (srv_sessions[si].seq < srv_sessions[new_slot].seq)
+                            new_slot = si;
+                    }
+                }
+                srv_active_slot = new_slot;
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
@@ -7200,31 +7238,28 @@ static void serve_loop(
 
             // ---- Save session state ----
             free(gen_response);
-            // The KV caches + linear attention state already contain this conversation.
-            // Record the position so the next request can detect continuation.
-            session_pos = pos;
-            fprintf(stderr, "[serve] %s session_pos=%d\n", request_id, session_pos);
+            srv_sessions[srv_active_slot].kv_pos = pos;
+            srv_sessions[srv_active_slot].seq = srv_req_seq;
+            fprintf(stderr, "[serve] %s session_pos=%d slot=%d\n",
+                    request_id, pos, srv_active_slot);
 
-            // Save prompt + generated token IDs for implicit continuation detection.
-            // The next request's prompt (from Open WebUI) will be:
-            //   [original_prompt_tokens][gen_tokens][eos_token][newline][new_user_turn...]
-            // By caching prompt+gen (= session_pos tokens total), the comparison will
-            // find continuation_start = session_pos, so we skip re-prefilling everything
-            // already in the KV cache and only process the truly new tail tokens.
-            if (cached_prompt_ids) free(cached_prompt_ids);
+            // Save prompt + generated token IDs so next turn can detect continuation.
+            if (srv_sessions[srv_active_slot].ids) free(srv_sessions[srv_active_slot].ids);
             if (client_alive && n_gen_ids > 0) {
                 size_t total = (size_t)pt->count + (size_t)n_gen_ids;
-                cached_prompt_ids = malloc(total * sizeof(uint32_t));
-                if (cached_prompt_ids) {
-                    memcpy(cached_prompt_ids, pt->ids, (size_t)pt->count * sizeof(uint32_t));
-                    memcpy(cached_prompt_ids + pt->count, gen_ids_buf, (size_t)n_gen_ids * sizeof(uint32_t));
-                    n_cached_prompt = (int)total;
+                srv_sessions[srv_active_slot].ids = malloc(total * sizeof(uint32_t));
+                if (srv_sessions[srv_active_slot].ids) {
+                    memcpy(srv_sessions[srv_active_slot].ids, pt->ids,
+                           (size_t)pt->count * sizeof(uint32_t));
+                    memcpy(srv_sessions[srv_active_slot].ids + pt->count, gen_ids_buf,
+                           (size_t)n_gen_ids * sizeof(uint32_t));
+                    srv_sessions[srv_active_slot].count = (int)total;
                 } else {
-                    n_cached_prompt = 0;
+                    srv_sessions[srv_active_slot].count = 0;
                 }
             } else {
-                cached_prompt_ids = NULL;
-                n_cached_prompt = 0;
+                srv_sessions[srv_active_slot].ids = NULL;
+                srv_sessions[srv_active_slot].count = 0;
             }
             if (gen_ids_buf) { free(gen_ids_buf); gen_ids_buf = NULL; }
 
