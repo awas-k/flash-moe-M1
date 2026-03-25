@@ -6446,6 +6446,97 @@ static const char *CORS_RESPONSE =
     "Access-Control-Max-Age: 86400\r\n"
     "\r\n";
 
+
+//new
+// Build a full Qwen3-formatted prompt from all messages in an OpenAI messages array.
+// Allocates and returns a new string — caller must free().
+static char *build_qwen_prompt(const char *buf) {
+    // Result buffer — allocate generously
+    size_t buf_len = strlen(buf);
+    size_t out_size = buf_len * 2 + 64;
+    char *out = malloc(out_size);
+    if (!out) return NULL;
+    out[0] = '\0';
+    size_t out_len = 0;
+
+    const char *p = buf;
+    for (;;) {
+        // Find next message object with a "role"
+        const char *role_key = strstr(p, "\"role\"");
+        if (!role_key) break;
+
+        // Extract role value
+        const char *r = role_key + 6;
+        while (*r == ' ' || *r == ':' || *r == '\t') r++;
+        if (*r != '"') { p = role_key + 1; continue; }
+        r++; // skip opening quote
+        char role[32] = {0};
+        int ri = 0;
+        while (*r && *r != '"' && ri < 31) role[ri++] = *r++;
+        role[ri] = '\0';
+
+        // Find the "content" after this role
+        const char *content_key = strstr(r, "\"content\"");
+        if (!content_key) break;
+        const char *c = content_key + 9;
+        while (*c == ' ' || *c == ':' || *c == '\t') c++;
+        if (*c != '"') { p = content_key + 1; continue; }
+        c++; // skip opening quote
+
+        // Extract and unescape content
+        char *content = malloc(buf_len + 1);
+        if (!content) { free(out); return NULL; }
+        char *w = content;
+        while (*c && !(*c == '"' && *(c-1) != '\\')) {
+            if (*c == '\\' && *(c+1)) {
+                c++;
+                switch (*c) {
+                    case 'n':  *w++ = '\n'; break;
+                    case 't':  *w++ = '\t'; break;
+                    case '"':  *w++ = '"';  break;
+                    case '\\': *w++ = '\\'; break;
+                    default:   *w++ = '\\'; *w++ = *c; break;
+                }
+            } else {
+                *w++ = *c;
+            }
+            c++;
+        }
+        *w = '\0';
+
+        // Append <|im_start|>role\ncontent<|im_end|>\n
+        size_t needed = out_len
+                      + 13               // <|im_start|>
+                      + strlen(role) + 1 // role + \n
+                      + strlen(content)
+                      + 11              // <|im_end|>\n
+                      + 1;
+        if (needed > out_size) {
+            out_size = needed * 2;
+            out = realloc(out, out_size);
+            if (!out) { free(content); return NULL; }
+        }
+        out_len += snprintf(out + out_len, out_size - out_len,
+                            "<|im_start|>%s\n%s<|im_end|>\n",
+                            role, content);
+        free(content);
+        p = c;
+    }
+
+    // Append assistant turn opener
+    const char *suffix = "<|im_start|>assistant\n";
+    size_t needed = out_len + strlen(suffix) + 1;
+    if (needed > out_size) {
+        out = realloc(out, needed);
+        if (!out) return NULL;
+    }
+    strcat(out, suffix);
+
+    return out; // caller must free()
+}
+//end
+
+
 // Tokenize a user turn (system prompt already cached in KV).
 // Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
 static PromptTokens *tokenize_user_turn(const char *user_content) {
@@ -6793,16 +6884,26 @@ static void serve_loop(
             int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
 
             // Extract user content from messages (mutates body — must be last)
-            char *content = extract_last_content(body);
+            //char *content = extract_last_content(body);
+            //if (!content || strlen(content) == 0) {
+            //    http_write_str(client_fd,
+            //        "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
+            //        "{\"error\":\"no content in messages\"}\n");
+            //    free(reqbuf); close(client_fd); continue;
+            //
+            int is_continuation = (has_session &&
+                                   active_session_id[0] != '\0' &&
+                                   strcmp(req_session_id, active_session_id) == 0);
+
+            // NEW
+            char *content = build_qwen_prompt(body);
             if (!content || strlen(content) == 0) {
                 http_write_str(client_fd,
                     "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"no content in messages\"}\n");
                 free(reqbuf); close(client_fd); continue;
             }
-            int is_continuation = (has_session &&
-                                   active_session_id[0] != '\0' &&
-                                   strcmp(req_session_id, active_session_id) == 0);
+            // content is now heap-allocated — must free() it after use
 
             // Session persistence is handled by the client (chat.m)
 
