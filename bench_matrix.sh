@@ -12,6 +12,8 @@
 #   ./bench_matrix.sh --tokens 128              # shorter generation
 #   ./bench_matrix.sh --cold                    # purge page cache between runs (needs sudo)
 #   ./bench_matrix.sh --quick                   # single run, K=4 only (CI smoke test)
+# Environment:
+#   CACHE_MB=256 ./bench_matrix.sh              # enable malloc expert cache (MB)
 
 set -euo pipefail
 
@@ -105,12 +107,19 @@ start_server() {
     local k_val="$1"
     cleanup
 
+    local cache_flag=""
+    if [[ "${CACHE_MB:-0}" -gt 0 ]]; then
+        cache_flag="--cache-mb ${CACHE_MB}"
+    fi
+
+    # shellcheck disable=SC2086  # intentional word split for optional cache flag
     "${INFER}" \
         --model "${MODEL_DIR}" \
         --weights "${WEIGHTS}" \
         --manifest "${MANIFEST}" \
         --vocab "${VOCAB}" \
         --k "${k_val}" \
+        ${cache_flag} \
         --serve "${PORT}" >/dev/null 2>&1 &
     SERVER_PID=$!
 

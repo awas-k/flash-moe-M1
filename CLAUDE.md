@@ -110,14 +110,14 @@ Before making any code change:
 ### High priority — SSD pressure reduction
 - [x] Benchmark K=3 vs K=4 vs K=5 (quality vs speed tradeoff) — K=3: 12.77 tok/s, K=4: 11.91, K=5: ~11 est. All quality=pass.
 - [ ] Profile expert routing frequency — identify "hot" experts
-- [ ] Test small pinned expert cache (~500 MB) for top-N hot experts per layer
+- [x] Test small pinned expert cache (~500 MB) for top-N hot experts per layer — WORSE. 256MB cache: 8.35 tok/s (−21% vs 10.54 baseline). Trust the OS wins at 1.7:1 ratio too. malloc cache competes with page cache for same physical RAM. Flag --cache-mb kept but default=0.
 - [ ] Measure actual page cache hit rate during sustained generation
 
 ### Medium priority — GPU kernel tuning for M1 Pro
 - [x] Test original danveloper threadgroup sizes vs tayoun tg128 variants — tg256 wins +9% on M1 Pro (14-core). tg128 was M4-specific, hurts M1 Pro. APPLIED.
 - [x] Test wider threadgroups to exploit M1 Pro's 200 GB/s bandwidth — confirmed: tg256 better. CMD2 −0.082ms/layer, CMD1 −0.106ms/layer.
 - [ ] Profile Metal shader occupancy via Xcode GPU profiler
-- [ ] Benchmark with/without FMA dequant kernel on M1 Pro specifically
+- [x] Benchmark with/without FMA dequant kernel on M1 Pro specifically — FMA (matvec_v3) is the exclusive active kernel on all hot paths. matvec_fast never fires (in_dim always ≤ 4096), v5/LUT is dead in serve mode. No accidental fallback.
 
 ### Low priority — pipeline experiments
 - [ ] Test overlapping SSD pread with CMD1 GPU dispatch on M1 Pro

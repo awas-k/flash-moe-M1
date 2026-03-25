@@ -7142,6 +7142,7 @@ static void print_usage(const char *prog) {
     printf("  --k N                Active experts per layer (default: 4)\n");
     printf("  --cache-entries N    Expert LRU cache size (default: 2500, 0 = disabled)\n");
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
+    printf("  --cache-mb N         Malloc expert cache size in MB (convenience alias for --malloc-cache)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
@@ -7167,6 +7168,7 @@ int main(int argc, char **argv) {
         int K = 6;
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
+        int cache_mb = 0;  // 0 = disabled (override with --cache-mb; converted to entries after config load)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
 
         static struct option long_options[] = {
@@ -7180,6 +7182,7 @@ int main(int argc, char **argv) {
             {"k",             required_argument, 0, 'k'},
             {"cache-entries",  required_argument, 0, 'C'},
             {"malloc-cache",   required_argument, 0, 'M'},
+            {"cache-mb",       required_argument, 0, 'X'},
             {"cpu-linear",    no_argument,       0, 'L'},
             {"skip-linear",   no_argument,       0, 'S'},
             {"timing",        no_argument,       0, 'T'},
@@ -7196,7 +7199,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:X:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -7208,6 +7211,7 @@ int main(int argc, char **argv) {
                 case 'k': K = atoi(optarg); break;
                 case 'C': cache_entries = atoi(optarg); break;
                 case 'M': malloc_cache_entries = atoi(optarg); break;
+                case 'X': cache_mb = atoi(optarg); break;
                 case 'L': gpu_linear_attn_enabled = 0; break;
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
@@ -7318,6 +7322,15 @@ int main(int argc, char **argv) {
         // ---- Initialize persistent I/O thread pool ----
         io_pool_init();
         infer_prefetch_init();
+
+        // ---- Convert --cache-mb to entries (requires cfg.expert_size_4bit from config load) ----
+        if (cache_mb > 0 && malloc_cache_entries == 0) {
+            size_t esz = cfg.expert_size_4bit > 0 ? cfg.expert_size_4bit : 1769472;
+            malloc_cache_entries = (int)((size_t)cache_mb * 1024 * 1024 / esz);
+            if (malloc_cache_entries < 1) malloc_cache_entries = 1;
+            fprintf(stderr, "[cache-mb] %d MB → %d entries (%.0f MB actual, expert_size=%zu bytes)\n",
+                    cache_mb, malloc_cache_entries, (double)malloc_cache_entries * esz / (1024*1024), esz);
+        }
 
         // ---- Initialize malloc expert cache (if requested) ----
         if (malloc_cache_entries > 0) {
