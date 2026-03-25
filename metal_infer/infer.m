@@ -6451,6 +6451,8 @@ static const char *CORS_RESPONSE =
 // Build a full Qwen3-formatted prompt from all messages in an OpenAI messages array.
 // Allocates and returns a new string — caller must free().
 static char *build_qwen_prompt(const char *buf) {
+
+
     // Result buffer — allocate generously
     size_t buf_len = strlen(buf);
     size_t out_size = buf_len * 2 + 64;
@@ -6458,8 +6460,9 @@ static char *build_qwen_prompt(const char *buf) {
     if (!out) return NULL;
     out[0] = '\0';
     size_t out_len = 0;
-
     const char *p = buf;
+    // Force no_think option
+    const char *no_think_system = "<|im_start|>system\n/no_think<|im_end|>\n";
     for (;;) {
         // Find next message object with a "role"
         const char *role_key = strstr(p, "\"role\"");
