@@ -6446,127 +6446,6 @@ static const char *CORS_RESPONSE =
     "Access-Control-Max-Age: 86400\r\n"
     "\r\n";
 
-
-//new
-// Build a full Qwen3-formatted prompt from all messages in an OpenAI messages array.
-// Allocates and returns a new string — caller must free().
-static char *build_qwen_prompt(const char *buf) {
-
-
-    // Result buffer — allocate generously
-    size_t buf_len = strlen(buf);
-    size_t out_size = buf_len * 2 + 64;
-    char *out = malloc(out_size);
-    if (!out) return NULL;
-    out[0] = '\0';
-    size_t out_len = 0;
-    const char *p = buf;
-    int has_system = 0;
-    for (;;) {
-        // Find next message object with a "role"
-        const char *role_key = strstr(p, "\"role\"");
-        if (!role_key) break;
-
-        // Extract role value
-        const char *r = role_key + 6;
-        while (*r == ' ' || *r == ':' || *r == '\t') r++;
-        if (*r != '"') { p = role_key + 1; continue; }
-        r++; // skip opening quote
-        char role[32] = {0};
-        int ri = 0;
-        while (*r && *r != '"' && ri < 31) role[ri++] = *r++;
-        role[ri] = '\0';
-
-        // Find the "content" after this role
-        const char *content_key = strstr(r, "\"content\"");
-        if (!content_key) break;
-        const char *c = content_key + 9;
-        while (*c == ' ' || *c == ':' || *c == '\t') c++;
-        if (*c != '"') { p = content_key + 1; continue; }
-        c++; // skip opening quote
-
-        // Extract and unescape content
-        char *content = malloc(buf_len + 1);
-        if (!content) { free(out); return NULL; }
-        char *w = content;
-        while (*c && !(*c == '"' && *(c-1) != '\\')) {
-            if (*c == '\\' && *(c+1)) {
-                c++;
-                switch (*c) {
-                    case 'n':  *w++ = '\n'; break;
-                    case 't':  *w++ = '\t'; break;
-                    case '"':  *w++ = '"';  break;
-                    case '\\': *w++ = '\\'; break;
-                    default:   *w++ = '\\'; *w++ = *c; break;
-                }
-            } else {
-                *w++ = *c;
-            }
-            c++;
-        }
-        *w = '\0';
-
-        // Append <|im_start|>role\ncontent<|im_end|>\n
-        size_t needed = out_len
-                      + 13               // <|im_start|>
-                      + strlen(role) + 1 // role + \n
-                      + strlen(content)
-                      + 11              // <|im_end|>\n
-                      + 1;
-        if (needed > out_size) {
-            out_size = needed * 2;
-            out = realloc(out, out_size);
-            if (!out) { free(content); return NULL; }
-        }
-        if (strcmp(role, "system") == 0) {
-            has_system = 1;
-            out_len += snprintf(out + out_len, out_size - out_len,
-                                "<|im_start|>system\n/no_think\n%s<|im_end|>\n",
-                                content);
-        } else {
-            out_len += snprintf(out + out_len, out_size - out_len,
-                                "<|im_start|>%s\n%s<|im_end|>\n",
-                                role, content);
-        }
-        free(content);
-        p = c;
-    }
-
-    // If no system message was in the request, inject /no_think system block.
-    if (!has_system) {
-        const char *inject = "<|im_start|>system\n/no_think<|im_end|>\n";
-        size_t inject_len = strlen(inject);
-        size_t needed = out_len + inject_len + 1;
-        if (needed > out_size) {
-            out_size = needed * 2;
-            char *tmp = malloc(out_size);
-            if (tmp) {
-                memcpy(tmp, inject, inject_len);
-                memcpy(tmp + inject_len, out, out_len + 1);
-                free(out);
-                out = tmp;
-            }
-        } else {
-            memmove(out + inject_len, out, out_len + 1);
-            memcpy(out, inject, inject_len);
-        }
-        out_len += inject_len;
-    }
-
-    // Append assistant turn opener
-    const char *suffix = "<|im_start|>assistant\n";
-    size_t needed = out_len + strlen(suffix) + 1;
-    if (needed > out_size) {
-        out = realloc(out, needed);
-        if (!out) return NULL;
-    }
-    strcat(out, suffix);
-
-    return out; // caller must free()
-}
-//end
-
-
 // Tokenize a user turn (system prompt already cached in KV).
 // Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
 static PromptTokens *tokenize_user_turn(const char *user_content) {
@@ -6837,13 +6716,11 @@ static void serve_loop(
     }
     int sys_prompt_len = sys_pos;  // number of tokens in system prompt cache
 
-    // ---- Session state: single-slot session cache ----
+    // ---- Session state: track one active conversation session ----
     // The KV caches + linear attention state ARE the session.
-    // Implicit session continuity: detect continuation by checking if the new tokenized
-    // prompt starts with the cached prompt+gen tokens from the previous completed request.
-    int session_pos = 0;        // pos after last generation
-    uint32_t *cached_prompt_ids = NULL;
-    int n_cached_prompt = 0;
+    // We just track whether to restore from snapshot (new session) or continue (same session).
+    char active_session_id[64] = {0};
+    int session_pos = 0;  // RoPE position after last generation for the active session
 
     for (;;) {
         struct sockaddr_in client_addr;
@@ -6908,132 +6785,141 @@ static void serve_loop(
             }
             body += 4;
 
-            // Extract max_tokens from request
+            // Extract session_id and max_tokens BEFORE content extraction
+            // (extract_last_content mutates the body buffer in place)
             int max_gen = extract_max_tokens(body, 8192);
             if (max_gen > 32768) max_gen = 32768;
+            char req_session_id[64] = {0};
+            int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
 
-            // Build the full Qwen3-formatted prompt from all messages in the request.
-            // build_qwen_prompt returns a complete formatted string including all turns
-            // and the assistant turn opener, e.g.:
-            //   <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
-            char *content = build_qwen_prompt(body);
+            // Extract user content from messages (mutates body — must be last)
+            char *content = extract_last_content(body);
             if (!content || strlen(content) == 0) {
                 http_write_str(client_fd,
                     "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"no content in messages\"}\n");
-                free(content); free(reqbuf); close(client_fd); continue;
+                free(reqbuf); close(client_fd); continue;
             }
-            // content is now heap-allocated — must free() it after use
+            int is_continuation = (has_session &&
+                                   active_session_id[0] != '\0' &&
+                                   strcmp(req_session_id, active_session_id) == 0);
+
+            // Session persistence is handled by the client (chat.m)
 
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
 
-            // ---- Tokenize the full prompt directly ----
-            // We tokenize build_qwen_prompt's output directly (no extra wrapping).
-            PromptTokens *pt = encode_prompt_text_to_tokens(content);
+            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, session=%s%s\n",
+                    request_id, strlen(content), max_gen,
+                    has_session ? req_session_id : "(none)",
+                    is_continuation ? " [CONTINUE]" : " [NEW]");
+
+            // ---- Tokenize ----
+            // Continuation: prefix with <|im_end|>\n to close prior assistant turn
+            // New session: just the user turn (system prompt restored from snapshot)
+            PromptTokens *pt;
+            if (is_continuation) {
+                pt = tokenize_continuation_turn(content);
+            } else {
+                pt = tokenize_user_turn(content);
+            }
             if (!pt) {
                 http_write_str(client_fd,
                     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"tokenization failed\"}\n");
-                free(content); free(reqbuf); close(client_fd); continue;
+                free(reqbuf); close(client_fd); continue;
             }
 
-            // ---- Implicit session continuity detection ----
-            // Continuation requires both:
-            //   1. new prompt is strictly longer than the cached token array
-            //   2. all cached tokens match the new prompt prefix exactly (memcmp)
-            int is_continuation = 0;
-            int continuation_start = 0;
-            if (n_cached_prompt > 0 && pt->count > n_cached_prompt &&
-                memcmp(pt->ids, cached_prompt_ids,
-                       (size_t)n_cached_prompt * sizeof(uint32_t)) == 0) {
-                is_continuation = 1;
-                continuation_start = n_cached_prompt;
-            }
-
-            fprintf(stderr, "[serve] %s content=%zu chars, prompt=%d tokens, max_tokens=%d%s\n",
-                    request_id, strlen(content), pt->count, max_gen,
-                    is_continuation ? " [CONTINUATION]" : " [NEW]");
-            if (is_continuation) {
-                fprintf(stderr, "[serve] %s continuation: cached=%d tokens, new_tail=%d tokens, session_pos=%d\n",
-                        request_id, n_cached_prompt, pt->count - continuation_start, session_pos);
-            }
+            fprintf(stderr, "[serve] %s prompt=%d tokens%s\n", request_id, pt->count,
+                    is_continuation ? " (continuation — skipping snapshot restore)" : "");
 
             int pos;
             if (is_continuation) {
                 // ---- Continue from existing session state ----
                 // The KV caches + linear attention state already contain the full
-                // conversation history up to session_pos. Only the new tail tokens
-                // (pt->ids[continuation_start..pt->count-1]) need to be prefilled.
+                // conversation history. Just set pos to where we left off.
                 pos = session_pos;
             } else {
-                // ---- New conversation: reset all state to zero ----
-                // Full prefill of the entire prompt from position 0.
-                // We reset all KV caches and linear attention state before prefilling,
-                // because we now tokenize the complete formatted prompt directly
-                // (including the system message), so the sys-prompt snapshot is not used.
+                // ---- Restore state from system prompt snapshot ----
+                // Instead of resetting to zero, restore to the cached system prompt state.
+                // This skips re-prefilling the system prompt tokens (~20 tokens, ~6s saved).
                 for (int i = 0; i < cfg.num_layers; i++) {
-                    if (kv_caches[i]) {
+                    if (kv_caches[i] && kv_snapshots[i].k_snapshot) {
+                        size_t sz = sys_prompt_len * kv_dim * sizeof(float);
+                        memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
+                        memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
+                        kv_caches[i]->len = kv_snapshots[i].len;
+                        // Also restore GPU KV mirror
+                        if (g_metal) {
+                            int fa_idx = cfg.full_attn_index[i];
+                            if (fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
+                                memcpy([g_metal->buf_kv_k[fa_idx] contents],
+                                       kv_snapshots[i].k_snapshot, sz);
+                                memcpy([g_metal->buf_kv_v[fa_idx] contents],
+                                       kv_snapshots[i].v_snapshot, sz);
+                            }
+                        }
+                    } else if (kv_caches[i]) {
                         kv_caches[i]->len = 0;
                     }
-                    if (layer_states[i]) {
+                    if (layer_states[i] && la_conv_snapshots[i]) {
+                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                        memcpy(s->conv_state, la_conv_snapshots[i], conv_state_size);
+                        memcpy(s->ssm_state, la_ssm_snapshots[i], ssm_state_size);
+                    } else if (layer_states[i]) {
                         LinearAttnState *s = (LinearAttnState *)layer_states[i];
                         memset(s->conv_state, 0, conv_state_size);
                         memset(s->ssm_state, 0, ssm_state_size);
                     }
                 }
-                // Reset GPU delta-net state
+                // Restore GPU delta-net state
                 if (g_metal && g_metal->delta_net_step) {
                     for (int i = 0; i < cfg.num_linear_layers; i++) {
-                        if (g_metal->buf_delta_state[i]) {
-                            size_t delta_sz = (size_t)cfg.linear_num_v_heads*cfg.linear_value_dim*cfg.linear_key_dim*sizeof(float);
-                            memset([g_metal->buf_delta_state[i] contents], 0, delta_sz);
-                        }
-                        if (g_metal->buf_conv_state[i]) {
-                            size_t conv_sz = (cfg.conv_kernel_size-1)*(size_t)cfg.linear_conv_dim*sizeof(float);
-                            memset([g_metal->buf_conv_state[i] contents], 0, conv_sz);
-                        }
+                        if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
+                            memcpy([g_metal->buf_delta_state[i] contents],
+                                   gpu_delta_snapshots[i], (size_t)cfg.linear_num_v_heads*cfg.linear_value_dim*cfg.linear_key_dim*sizeof(float));
+                        if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
+                            memcpy([g_metal->buf_conv_state[i] contents],
+                                   gpu_conv_snapshots[i], (cfg.conv_kernel_size-1)*(size_t)cfg.linear_conv_dim*sizeof(float));
                     }
                 } else {
                     reset_delta_net_state();
                 }
-                pos = 0;  // full prefill from the beginning
-                // Invalidate cache so next request doesn't misdetect continuation.
-                if (cached_prompt_ids) { free(cached_prompt_ids); cached_prompt_ids = NULL; }
-                n_cached_prompt = 0;
+                pos = sys_prompt_len;  // start after cached system prompt
+                // Update active session
+                if (has_session) {
+                    strncpy(active_session_id, req_session_id, sizeof(active_session_id) - 1);
+                    active_session_id[sizeof(active_session_id) - 1] = '\0';
+                } else {
+                    active_session_id[0] = '\0';
+                }
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
             // ---- Send SSE headers ----
             http_write_str(client_fd, SSE_HEADERS);
 
-            if (sse_send_role(client_fd, request_id) < 0) { free(pt->ids); free(pt); free(content); free(reqbuf); close(client_fd); continue; }
-            if (sse_send_keepalive(client_fd) < 0) { free(pt->ids); free(pt); free(content); free(reqbuf); close(client_fd); continue; }
+            if (sse_send_role(client_fd, request_id) < 0) { free(pt->ids); free(pt); free(reqbuf); close(client_fd); continue; }
+            if (sse_send_keepalive(client_fd) < 0) { free(pt->ids); free(pt); free(reqbuf); close(client_fd); continue; }
 
             // ---- Batch prefill ----
-            // For continuations, only prefill the new tail tokens (pt->ids[continuation_start..]).
-            // For new conversations, prefill all tokens from position 0.
             double t_prefill = now_ms();
-            int prefill_start = is_continuation ? continuation_start : 0;
-            int n_prefill = pt->count - prefill_start;  // number of tokens to actually prefill
-
-            // Pre-embed the tokens we need to prefill
+            // Pre-embed all request tokens
             float *serve_embed_batch = NULL;
-            if (n_prefill > 1) {
-                serve_embed_batch = malloc((size_t)n_prefill * cfg.hidden_dim * sizeof(float));
-                for (int i = 0; i < n_prefill; i++) {
-                    embed_lookup(wf, pt->ids[prefill_start + i],
-                                 serve_embed_batch + (size_t)i * cfg.hidden_dim);
+            if (pt->count > 1) {
+                serve_embed_batch = malloc((size_t)pt->count * cfg.hidden_dim * sizeof(float));
+                for (int i = 0; i < pt->count; i++) {
+                    embed_lookup(wf, pt->ids[i], serve_embed_batch + (size_t)i * cfg.hidden_dim);
                 }
             }
             // Intermediate prefill tokens: discard last-layer expert output
-            for (int i = 0; i < n_prefill - 1; i++) {
+            for (int i = 0; i < pt->count - 1; i++) {
                 cache_telemetry_note_token();
                 if (serve_embed_batch) {
                     memcpy(hidden, serve_embed_batch + (size_t)i * cfg.hidden_dim,
                            cfg.hidden_dim * sizeof(float));
                 } else {
-                    embed_lookup(wf, pt->ids[prefill_start + i], hidden);
+                    embed_lookup(wf, pt->ids[i], hidden);
                 }
                 for (int layer = 0; layer < cfg.num_layers; layer++) {
                     int is_full = cfg.is_full_attn[layer];
@@ -7051,10 +6937,10 @@ static void serve_loop(
             {
                 cache_telemetry_note_token();
                 if (serve_embed_batch) {
-                    memcpy(hidden, serve_embed_batch + (size_t)(n_prefill - 1) * cfg.hidden_dim,
+                    memcpy(hidden, serve_embed_batch + (size_t)(pt->count - 1) * cfg.hidden_dim,
                            cfg.hidden_dim * sizeof(float));
                 } else {
-                    embed_lookup(wf, pt->ids[prefill_start + n_prefill - 1], hidden);
+                    embed_lookup(wf, pt->ids[0], hidden);
                 }
                 for (int layer = 0; layer < cfg.num_layers; layer++) {
                     int is_full = cfg.is_full_attn[layer];
@@ -7070,8 +6956,8 @@ static void serve_loop(
             }
             if (serve_embed_batch) { free(serve_embed_batch); serve_embed_batch = NULL; }
             double prefill_ms = now_ms() - t_prefill;
-            fprintf(stderr, "[serve] %s prefill=%d tokens (of %d total) in %.0fms\n",
-                    request_id, n_prefill, pt->count, prefill_ms);
+            fprintf(stderr, "[serve] %s prefill=%d tokens in %.0fms\n",
+                    request_id, pt->count, prefill_ms);
 
             // ---- Final norm + LM head for first token ----
             if (final_norm_w) {
@@ -7100,12 +6986,6 @@ static void serve_loop(
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
 
-            // Track generated token IDs for continuation detection.
-            // We need to store prompt + gen tokens so the next request's prefix comparison
-            // finds the correct continuation_start = session_pos (not just prompt_len).
-            uint32_t *gen_ids_buf = malloc((size_t)(max_gen + 2) * sizeof(uint32_t));
-            int n_gen_ids = 0;
-
             // Stream first token immediately after first logits are ready
             for (int gen = 0; gen < max_gen; gen++) {
                 if (next_token == prev_token) repeat_run++;
@@ -7121,8 +7001,6 @@ static void serve_loop(
                 }
 
                 if (next_token == cfg.eos_token_ids[0] || next_token == cfg.eos_token_ids[1]) {
-                    // Record EOS token before feeding it through the model
-                    if (gen_ids_buf) gen_ids_buf[n_gen_ids++] = (uint32_t)next_token;
                     // Feed EOS through the model so session state includes it
                     cache_telemetry_note_token();
                     embed_lookup(wf, next_token, hidden);
@@ -7169,8 +7047,6 @@ static void serve_loop(
                     }
                 }
 
-                // Record token ID for continuation detection
-                if (gen_ids_buf) gen_ids_buf[n_gen_ids++] = (uint32_t)next_token;
                 gen_count++;
 
                 // Generate next token
@@ -7214,27 +7090,12 @@ static void serve_loop(
 
             // ---- Save session state ----
             free(gen_response);
+            // The KV caches + linear attention state already contain this conversation.
+            // Just record the position so the next request can continue from here.
             session_pos = pos;
-            fprintf(stderr, "[serve] %s session_pos=%d\n", request_id, pos);
-
-            // Save prompt + generated token IDs so next turn can detect continuation.
-            if (cached_prompt_ids) free(cached_prompt_ids);
-            if (client_alive && n_gen_ids > 0) {
-                size_t total = (size_t)pt->count + (size_t)n_gen_ids;
-                cached_prompt_ids = malloc(total * sizeof(uint32_t));
-                if (cached_prompt_ids) {
-                    memcpy(cached_prompt_ids, pt->ids, (size_t)pt->count * sizeof(uint32_t));
-                    memcpy(cached_prompt_ids + pt->count, gen_ids_buf,
-                           (size_t)n_gen_ids * sizeof(uint32_t));
-                    n_cached_prompt = (int)total;
-                } else {
-                    n_cached_prompt = 0;
-                }
-            } else {
-                cached_prompt_ids = NULL;
-                n_cached_prompt = 0;
-            }
-            if (gen_ids_buf) { free(gen_ids_buf); gen_ids_buf = NULL; }
+            fprintf(stderr, "[serve] %s session_pos=%d (session=%s)\n",
+                    request_id, session_pos,
+                    active_session_id[0] ? active_session_id : "(none)");
 
             double gen_ms = now_ms() - t_gen;
             fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)\n",
@@ -7248,7 +7109,6 @@ static void serve_loop(
 
             free(pt->ids);
             free(pt);
-            free(content);
             free(reqbuf);
             close(client_fd);
             continue;
@@ -7282,7 +7142,6 @@ static void print_usage(const char *prog) {
     printf("  --k N                Active experts per layer (default: 4)\n");
     printf("  --cache-entries N    Expert LRU cache size (default: 2500, 0 = disabled)\n");
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
-    printf("  --cache-mb N         Malloc expert cache size in MB (convenience alias for --malloc-cache)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
@@ -7308,7 +7167,6 @@ int main(int argc, char **argv) {
         int K = 6;
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
-        int cache_mb = 0;  // 0 = disabled (override with --cache-mb; converted to entries after config load)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
 
         static struct option long_options[] = {
@@ -7322,7 +7180,6 @@ int main(int argc, char **argv) {
             {"k",             required_argument, 0, 'k'},
             {"cache-entries",  required_argument, 0, 'C'},
             {"malloc-cache",   required_argument, 0, 'M'},
-            {"cache-mb",       required_argument, 0, 'X'},
             {"cpu-linear",    no_argument,       0, 'L'},
             {"skip-linear",   no_argument,       0, 'S'},
             {"timing",        no_argument,       0, 'T'},
@@ -7339,7 +7196,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:X:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -7351,7 +7208,6 @@ int main(int argc, char **argv) {
                 case 'k': K = atoi(optarg); break;
                 case 'C': cache_entries = atoi(optarg); break;
                 case 'M': malloc_cache_entries = atoi(optarg); break;
-                case 'X': cache_mb = atoi(optarg); break;
                 case 'L': gpu_linear_attn_enabled = 0; break;
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
@@ -7462,15 +7318,6 @@ int main(int argc, char **argv) {
         // ---- Initialize persistent I/O thread pool ----
         io_pool_init();
         infer_prefetch_init();
-
-        // ---- Convert --cache-mb to entries (requires cfg.expert_size_4bit from config load) ----
-        if (cache_mb > 0 && malloc_cache_entries == 0) {
-            size_t esz = cfg.expert_size_4bit > 0 ? cfg.expert_size_4bit : 1769472;
-            malloc_cache_entries = (int)((size_t)cache_mb * 1024 * 1024 / esz);
-            if (malloc_cache_entries < 1) malloc_cache_entries = 1;
-            fprintf(stderr, "[cache-mb] %d MB → %d entries (%.0f MB actual, expert_size=%zu bytes)\n",
-                    cache_mb, malloc_cache_entries, (double)malloc_cache_entries * esz / (1024*1024), esz);
-        }
 
         // ---- Initialize malloc expert cache (if requested) ----
         if (malloc_cache_entries > 0) {
