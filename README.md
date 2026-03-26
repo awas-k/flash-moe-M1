@@ -1,19 +1,33 @@
-# Flash-MoE
+# Flash-MoE M1 Pro Optimization
 
-Pure C/Metal inference engine for running large Qwen MoE models on Apple Silicon by streaming routed experts from SSD.
+## Project context
 
-## Headline Result
+This is a fork of tayoun/flash-moe (itself adapted from danveloper/flash-moe).
+It runs Qwen3.5-35B-A3B (35B param MoE, 256 experts, 40 layers) on Apple Silicon
+via pure C/Objective-C + Metal shaders, streaming expert weights from SSD.
 
-**Qwen3.5-35B-A3B on a $600 Mac mini (M4, 16GB): 11.5 tok/s sustained, 2.5s TTFT, production-quality output with tool calling.**
+**Target hardware**: MacBook Pro M1 Pro, 10-core CPU, 14-core GPU, 16 GB unified memory.
 
-This is a **2.6x speedup** over the original M3 Max baseline, on lower-cost hardware.
+**Current baseline**: 11.91 tok/s sustained, 1.83s TTFT at K=4. (K=3: 12.77 tok/s, 1.66s TTFT)
+
+**Reference results**:
+- M4 Mac mini 16 GB, K=6: 11.5 tok/s, 2.5s TTFT
+- M3 Max MBP 48 GB, K=4: 4.4 tok/s, ~5.6s TTFT
+
+
+
 
 ## Results
 
-| Machine | Model | K (active experts) | Sustained tok/s | TTFT | Notes |
+updated results table should be:
+
+| Machine | Model | K | tok/s | TTFT | Notes |
 |---|---|---:|---:|---:|---|
-| M3 Max MacBook Pro (48GB, original) | Qwen3.5-35B-A3B-4bit | 4 | 4.4 | ~5.6s | Original public baseline |
-| M4 Mac mini (16GB, current) | Qwen3.5-35B-A3B-4bit | 6 | **11.5** | **2.5s** | Current production setup |
+| M3 Max MBP (48 GB) | Qwen3.5-35B-A3B-4bit | 4 | 4.4 | ~5.6s | Original baseline |
+| M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | 4 | 9.16 | 2.39s | Before optimization |
+| M4 Mac mini (16 GB) | Qwen3.5-35B-A3B-4bit | 6 | 11.5 | 2.5s | tayoun reference |
+| **M1 Pro MBP (16 GB)** | **Qwen3.5-35B-A3B-4bit** | **4** | **11.91** | **1.71s** | **tg256 kernel, quality-verified** |
+
 
 ## Hardware
 
