@@ -54,3 +54,4 @@ docs/DECISIONS.md
 
 # Service / runtime state
 *.pid
+docs_ignore/
