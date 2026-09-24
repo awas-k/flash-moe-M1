@@ -248,4 +248,4 @@ MIT — see [LICENSE](LICENSE).
 Copyright (c) 2025 Daniel Woods  
 Copyright (c) 2025 Sujit Baruwal (35B model adaptation)  
 Copyright (c) 2026 Anthony Tayoun (M4 optimization, 2.6x performance improvement)  
-Copyright (c) 2026 awas-k (M1 Pro adaptation, 11.91 tok/s on M1 Pro 16GB)
+Copyright (c) 2026 awas-k (M1 Pro adaptation, 11.53 tok/s on M1 Pro 16GB)
