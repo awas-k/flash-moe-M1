@@ -9,8 +9,9 @@ via pure C/Objective-C + Metal shaders, streaming expert weights from SSD.
 **Target hardware**: MacBook Pro M1 Pro, 10-core CPU, 14-core GPU, 16 GB unified memory.
 
 **Current baseline** (tg256 kernel, git `089cb24`):
-- K=4: **11.91 tok/s** sustained, **1.71s** TTFT
-- K=3: **12.77 tok/s** sustained, **1.66s** TTFT
+- K=4: **11.91 tok/s** sustained, **1.71s** TTFT — the recommended profile
+- K=3: **12.77 tok/s** sustained, **1.66s** TTFT — faster, but **quality-degraded**; see
+  [Choosing K](#choosing-k)
 
 **Reference results**:
 - M4 Mac mini 16 GB, K=6: 11.5 tok/s, 2.5s TTFT (tayoun)
@@ -19,8 +20,12 @@ via pure C/Objective-C + Metal shaders, streaming expert weights from SSD.
 
 ## Results
 
-All runs: 256 output tokens, warm page cache, quality=pass.
+All runs: 256 output tokens, warm page cache, no crashes.
 tok/s and TTFT are per-run values (not averaged) unless noted.
+
+> These are throughput figures only. `bench.sh` reports `quality=pass` whenever ≥32 non-empty
+> tokens came back — a liveness check, not a quality measurement. Output quality is measured
+> separately by [`eval/`](eval/README.md); see [Choosing K](#choosing-k).
 
 | Machine | Model | Tag | K | tok/s | TTFT | Notes |
 |---|---|---|---:|---:|---:|---|
@@ -30,8 +35,8 @@ tok/s and TTFT are per-run values (not averaged) unless noted.
 | M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | baseline-sweep | 3 | 11.77 | 1.88s | avg 3 runs, before kernel tuning |
 | M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | baseline-sweep | 4 | 10.93 | 1.98s | avg 3 runs, before kernel tuning |
 | M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | baseline-sweep | 5 | 10.14 | 2.19s | avg 3 runs, before kernel tuning |
-| **M1 Pro MBP (16 GB)** | **Qwen3.5-35B-A3B-4bit** | **tg256-expert** | **3** | **12.77** | **1.66s** | **avg 3 runs, tg256 kernel** |
-| **M1 Pro MBP (16 GB)** | **Qwen3.5-35B-A3B-4bit** | **tg256-expert** | **4** | **11.91** | **1.71s** | **avg 3 runs, tg256 kernel** |
+| M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | tg256-expert | 3 | 12.77 | 1.66s | avg 3 runs, tg256 kernel — fastest, but quality-degraded |
+| **M1 Pro MBP (16 GB)** | **Qwen3.5-35B-A3B-4bit** | **tg256-expert** | **4** | **11.91** | **1.71s** | **avg 3 runs, tg256 kernel — recommended profile** |
 
 > New `baseline` run (git `8a217dd`, 2 runs/K): K=3: 12.60 tok/s / 1.75s TTFT, K=4: 11.53 tok/s / 1.94s TTFT, K=5: 10.61 tok/s / 2.13s TTFT, K=6: 9.66 tok/s / 2.44s TTFT
 
@@ -118,7 +123,8 @@ cd ..
   --serve 8000
 ```
 
-> **M1 Pro recommendation**: `--k 4` (11.91 tok/s, quality=pass). Use `--k 3` for maximum throughput (12.77 tok/s).
+> **M1 Pro recommendation**: `--k 4`. It matches the model's trained top-8 routing on the
+> quality eval while running 1.44× faster. Do **not** use `--k 3` — see [Choosing K](#choosing-k).
 > tayoun's upstream default `--k 6` is optimized for M4 and will be slower on M1 Pro (~9.66 tok/s).
 
 ### 6. Smoke test
@@ -140,12 +146,41 @@ K=4 ./bench.sh
 ```
 
 
+## Choosing K
+
+`--k` truncates the router's trained top-8 (`num_experts_per_tok: 8`) to the top K and
+renormalises, so every K below 8 discards routing mass the model was trained to use. What that
+costs is measured by [`eval/`](eval/README.md) over 26 scored prompts — sampling is greedy and
+deterministic, so differences are attributable to K alone.
+
+| K | eval pass | tok/s | repetition | agreement w/ K=8 | |
+|---:|---:|---:|---:|---:|---|
+| 3 | 23/26 | 11.22 | 0.041 | 54% | **degraded — avoid** |
+| 4 | 24/26 | 10.29 | 0.009 | 58% | **recommended** |
+| 6 | 25/26 | 8.36 | 0.000 | 65% | fine, slower |
+| 8 | 24/26 | 7.16 | 0.000 | — | trained routing, slowest |
+
+**K=4 is the sweet spot.** It matches trained top-8 routing (24 vs 24 of 26) at 1.44× the
+speed. K=6 and K=8 are within one item of it — noise on 26 prompts — and cost 19–30% throughput.
+
+**K=3 is degraded**, and the failure is verbosity rather than wrong facts: it stops stopping.
+A one-word translation came back as 370 characters; a 2–3 sentence question came back as 1814
+characters with the model's own drafting process left in. It also shows double the token-cap
+hits and 4.5× the repetition rate. The earlier "use K=3 for maximum throughput" advice
+predates this measurement and is withdrawn.
+
+Re-run it yourself with `./eval/sweep.sh`. Full analysis in
+[`docs/optimization-experiments-q4.md`](docs/optimization-experiments-q4.md).
+
+
 ## Repo Notes
 
 - Core runtime: `metal_infer/infer.m`, `metal_infer/shaders.metal`
 - Chat client: `metal_infer/chat.m`
+- Web chat UI: `web/chat.html` — see `docs/web-chat.md`
 - Benchmark (single run): `bench.sh`
 - Benchmark (sweep): `bench_matrix.sh`
+- Quality eval: `eval/` — see `eval/README.md`
 - Experiment log: `results.tsv`
 - Experiment notes: `docs/optimization-experiments-q4.md`
 - Technical paper: `paper/flash_moe.pdf`
