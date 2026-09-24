@@ -134,25 +134,36 @@ Press New chat.
 gates session persistence (`infer.m:7034`), and there is no `reasoning_content` field. The page
 splits `<think>…</think>` into a collapsed block.
 
-**Emoji and some multi-byte characters arrive corrupted.** This is a server bug, not a page
-bug, and no client can repair it. `sse_send_delta` (`infer.m:6355`) copies each token's bytes
-straight into a JSON string with a byte-oriented escape loop that has no UTF-8 awareness. When
-the tokenizer splits one character across several byte-level tokens — common for 4-byte emoji —
-each chunk carries a *fragment* of the UTF-8 sequence, so each chunk's JSON string is
-independently invalid and every standard decoder replaces it with U+FFFD. The halves can never
-be rejoined, because the damage happens inside separate JSON strings before the client sees
-them.
+**Emoji and multi-byte characters used to arrive corrupted. Fixed.** Kept here because the
+cause is worth knowing if you rebuild model artifacts from an older checkout.
 
-Reproduced by asking for five emoji: 👍, 🚀, 🔥 and 🎉 each arrived as several chunks
-containing one U+FFFD apiece, while 😊 happened to be a single complete token and survived
-intact.
+The root cause was in the vocab export, not the server. `export_vocab_35b.py` decoded every
+token *in isolation*:
 
-**CJK is affected too.** Most Japanese output comes through clean, but not all: in an eval run
-the kanji 犬 was corrupted 32 times in a single reply. So whether a character survives depends
-on how the tokenizer happens to split it, not on the script — do not assume CJK is safe.
+```python
+decoded = tokenizer.decode([token_id], skip_special_tokens=False)   # wrong
+```
 
-Fixing it means buffering incomplete UTF-8 sequences in `sse_send_delta` and flushing only
-complete characters.
+This is a byte-level BPE, so one character spans several tokens — 👍 is `[9008, 239, 235]` —
+and a token holding a lone continuation byte is not valid UTF-8 by itself. HuggingFace
+substituted U+FFFD, and that was baked into `vocab.bin` at build time: **1061 replacement
+characters, with the real bytes destroyed before the runtime ever saw them.** Nothing
+downstream could recover them. The exporter now recovers each token's raw bytes by inverting
+the ByteLevel mapping, and the runtime reassembles them by concatenation.
+
+A second, genuine bug sat behind it in `sse_send_delta` (`infer.m:6355`): once the vocab
+carries raw bytes, a character split across tokens means a chunk can end mid-sequence, and
+emitting that half makes the chunk's JSON string invalid. It now holds an incomplete trailing
+sequence back and prepends it to the next token, so 👍 arrives as one chunk rather than three
+fragments. A fragment still held at end of stream is flushed as a single U+FFFD, so loss is
+visible rather than silent.
+
+**If you see mojibake**, your `vocab.bin` predates this fix. Regenerate it:
+
+```bash
+python3 metal_infer/export_vocab_35b.py \
+  models/Qwen3.5-35B-A3B-4bit/tokenizer.json metal_infer/vocab.bin
+```
 
 
 ## Troubleshooting

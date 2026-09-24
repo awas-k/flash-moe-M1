@@ -6353,21 +6353,82 @@ static void http_write_str(int fd, const char *s) {
     http_write(fd, s, (int)strlen(s));
 }
 
+// ---- UTF-8 hold-back across SSE chunks ----
+// A byte-level BPE tokenizer can split one character across several tokens, so a
+// token's text may end mid-sequence. Emitting that half puts invalid UTF-8 inside
+// this chunk's JSON string; every standard decoder replaces it with U+FFFD, and
+// because the halves land in separate JSON strings the client can never rejoin
+// them. So hold an incomplete trailing sequence back and prepend it to the next
+// token. The server handles one request at a time (single accept loop), so one
+// file-scope buffer is sufficient; sse_send_role resets it per stream.
+#define SSE_UTF8_HOLD_MAX 3
+static unsigned char g_sse_utf8_hold[SSE_UTF8_HOLD_MAX];
+static size_t g_sse_utf8_hold_len = 0;
+
+// Length of the longest prefix of buf containing only complete UTF-8 sequences.
+// Anything after it is a truncated trailing sequence.
+static size_t sse_utf8_complete_prefix(const unsigned char *buf, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        unsigned char c = buf[i];
+        size_t need;
+        if (c < 0x80)             need = 1;
+        else if ((c & 0xE0) == 0xC0) need = 2;
+        else if ((c & 0xF0) == 0xE0) need = 3;
+        else if ((c & 0xF8) == 0xF0) need = 4;
+        else { i++; continue; }  // stray continuation / invalid lead: pass through
+        if (i + need > len) return i;  // truncated tail begins here
+        i += need;
+    }
+    return i;
+}
+
 // Send an SSE chunk with a token delta
 // Returns 0 on success, -1 if client disconnected
 static int sse_send_delta(int fd, const char *request_id, const char *token_text) {
     char chunk[4096];
-    // Escape the token text for JSON
+
+    // Merge anything held back from the previous token, then split on a character
+    // boundary and keep the remainder for next time.
+    unsigned char merged[1024 + SSE_UTF8_HOLD_MAX];
+    size_t mlen = 0;
+    for (size_t i = 0; i < g_sse_utf8_hold_len; i++) merged[mlen++] = g_sse_utf8_hold[i];
+    for (const unsigned char *r = (const unsigned char *)token_text;
+         *r && mlen < sizeof(merged); r++) {
+        merged[mlen++] = *r;
+    }
+
+    size_t emit = sse_utf8_complete_prefix(merged, mlen);
+    size_t hold = mlen - emit;
+    if (hold > SSE_UTF8_HOLD_MAX) {
+        // Cannot happen for well-formed UTF-8; emit rather than stall the stream.
+        emit = mlen;
+        hold = 0;
+    }
+    for (size_t i = 0; i < hold; i++) g_sse_utf8_hold[i] = merged[emit + i];
+    g_sse_utf8_hold_len = hold;
+
+    if (emit == 0) return 0;  // whole token was a fragment; it ships with the next one
+
+    // Escape for JSON
     char escaped[2048];
     char *w = escaped;
-    for (const char *r = token_text; *r && w < escaped + sizeof(escaped) - 8; r++) {
-        switch (*r) {
+    for (size_t i = 0; i < emit && w < escaped + sizeof(escaped) - 8; i++) {
+        unsigned char c = merged[i];
+        switch (c) {
             case '"':  *w++ = '\\'; *w++ = '"';  break;
             case '\\': *w++ = '\\'; *w++ = '\\'; break;
             case '\n': *w++ = '\\'; *w++ = 'n';  break;
             case '\r': *w++ = '\\'; *w++ = 'r';  break;
             case '\t': *w++ = '\\'; *w++ = 't';  break;
-            default:   *w++ = *r; break;
+            default:
+                if (c < 0x20) {
+                    // Raw control bytes are not legal in a JSON string either.
+                    w += snprintf(w, 7, "\\u%04x", c);
+                } else {
+                    *w++ = (char)c;
+                }
+                break;
         }
     }
     *w = '\0';
@@ -6387,6 +6448,10 @@ static int sse_send_delta(int fd, const char *request_id, const char *token_text
 }
 
 static int sse_send_role(int fd, const char *request_id) {
+    // New stream: drop any fragment left over from an aborted previous one, so it
+    // cannot leak into this response.
+    g_sse_utf8_hold_len = 0;
+
     char chunk[1024];
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
@@ -6415,6 +6480,26 @@ static int sse_send_keepalive(int fd) {
 }
 
 static void sse_send_done(int fd, const char *request_id) {
+    // A fragment still held at end of stream means generation stopped mid-character
+    // (hit max_tokens, or the model emitted malformed bytes). Send one U+FFFD so the
+    // client sees that something was lost, rather than silently dropping it or
+    // shipping invalid UTF-8.
+    if (g_sse_utf8_hold_len > 0) {
+        g_sse_utf8_hold_len = 0;
+        char frag[512];
+        int fn = snprintf(frag, sizeof(frag),
+            "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+            "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\ufffd\"},"
+            "\"finish_reason\":null}]}\n\n",
+            request_id);
+        int fs = 0;
+        while (fs < fn) {
+            ssize_t wr = write(fd, frag + fs, fn - fs);
+            if (wr <= 0) break;
+            fs += (int)wr;
+        }
+    }
+
     char chunk[1024];
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
