@@ -95,6 +95,9 @@
       <option value="stateless">Stateless</option>
     </select>
   </label>
+  <label title="Off pre-fills an empty <think> block so the model answers directly. Much cheaper for short answers.">
+    <input type="checkbox" id="thinking" checked> Thinking
+  </label>
   <button id="newChat">New chat</button>
   <button id="ping">Check server</button>
 </header>
@@ -132,6 +135,7 @@
   const el = {
     baseUrl: $("baseUrl"), maxTokens: $("maxTokens"), mode: $("mode"),
     newChat: $("newChat"), ping: $("ping"), log: $("log"), hint: $("hint"),
+    thinking: $("thinking"),
     input: $("input"), send: $("send"), status: $("status"), budget: $("budget"),
   };
 
@@ -212,6 +216,7 @@
     el.send.disabled = busy;
     el.ping.disabled = busy;   // never poll the server mid-stream
     el.mode.disabled = busy;
+    el.thinking.disabled = busy;
     el.baseUrl.disabled = busy;
     el.send.textContent = busy ? "…" : "Send";
   }
@@ -245,6 +250,9 @@
       messages: [{ role: "user", content: text }],
       max_tokens: Math.max(1, Math.min(32768, Number(el.maxTokens.value) || 2048)),
       stream: true,
+      // Sent explicitly either way, so the checkbox wins over a server started
+      // with --no-think rather than silently disagreeing with it.
+      enable_thinking: el.thinking.checked,
     };
     // Continuation mode is what makes multi-turn work: matching session_id keeps
     // the KV + delta-net state instead of restoring the system-prompt snapshot.

@@ -461,6 +461,12 @@ static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+// Suppress reasoning entirely by pre-filling a closed, empty <think> block in the
+// generation prompt -- the same mechanism as the model's own chat template under
+// `enable_thinking: false` (chat_template.jinja:149). This differs from a small
+// --think-budget, which still lets the model open a think block and then cuts it
+// off mid-thought; here it never starts one.
+static int g_no_think = 0;
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [cfg.num_layers] cold fds (set in main)
@@ -6324,6 +6330,20 @@ static void server_save_turn(const char *session_id, const char *role, const cha
 
 // Extract "session_id" string from JSON body. Copies into out_buf (max out_size).
 // Returns 1 if found, 0 if missing.
+// Per-request thinking toggle. Substring search, so it matches both a top-level
+// "enable_thinking" and one nested under "chat_template_kwargs" (the spelling
+// vLLM/SGLang and llama.cpp's --chat-template-kwargs use).
+// Returns 1 = disabled, 0 = explicitly enabled, -1 = unspecified.
+static int extract_enable_thinking(const char *buf) {
+    const char *p = strstr(buf, "\"enable_thinking\"");
+    if (!p) return -1;
+    p += strlen("\"enable_thinking\"");
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    if (strncmp(p, "false", 5) == 0) return 1;
+    if (strncmp(p, "true", 4) == 0) return 0;
+    return -1;
+}
+
 static int extract_session_id(const char *buf, char *out_buf, int out_size) {
     const char *p = strstr(buf, "\"session_id\"");
     if (!p) return 0;
@@ -6531,11 +6551,20 @@ static const char *CORS_RESPONSE =
     "Access-Control-Max-Age: 86400\r\n"
     "\r\n";
 
+// Tail of the generation prompt. With thinking disabled it carries an already
+// closed, empty <think> block, so the model starts on the answer instead of
+// opening one of its own.
+static const char *assistant_suffix(void) {
+    return g_no_think
+        ? "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        : "<|im_end|>\n<|im_start|>assistant\n";
+}
+
 // Tokenize a user turn (system prompt already cached in KV).
 // Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
 static PromptTokens *tokenize_user_turn(const char *user_content) {
     const char *prefix = "<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+    const char *suffix = assistant_suffix();
 
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
     char *prompt = malloc(prompt_len);
@@ -6553,7 +6582,7 @@ static PromptTokens *tokenize_continuation_turn(const char *user_content) {
     // EOS/<|im_end|> is already in the state (fed through model at end of generation)
     // Just need the newline + new user turn + assistant prompt
     const char *prefix = "\n<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+    const char *suffix = assistant_suffix();
 
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
     char *prompt = malloc(prompt_len);
@@ -6594,11 +6623,11 @@ static PromptTokens *tokenize_chat_message(const char *user_content) {
     // Build: <|im_start|>system\n{sys_prompt}<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
     size_t sys_len = strlen(sys_prompt_text);
     size_t user_len = strlen(user_content);
-    size_t total = 30 + sys_len + 30 + user_len + 40;  // generous padding for tags
+    size_t total = 30 + sys_len + 30 + user_len + 40 + strlen(assistant_suffix());
     char *prompt = malloc(total);
     if (!prompt) return NULL;
-    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
-             sys_prompt_text, user_content);
+    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s%s",
+             sys_prompt_text, user_content, assistant_suffix());
     PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
     free(prompt);
     return pt;
@@ -6876,6 +6905,7 @@ static void serve_loop(
             if (max_gen > 32768) max_gen = 32768;
             char req_session_id[64] = {0};
             int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
+            int req_thinking = extract_enable_thinking(body);
 
             // Extract user content from messages (mutates body — must be last)
             char *content = extract_last_content(body);
@@ -6902,12 +6932,19 @@ static void serve_loop(
             // ---- Tokenize ----
             // Continuation: prefix with <|im_end|>\n to close prior assistant turn
             // New session: just the user turn (system prompt restored from snapshot)
+            // Per-request override; restored immediately so one request cannot
+            // change the default for the next. Only prompt construction reads it.
+            int saved_no_think = g_no_think;
+            if (req_thinking == 1)      g_no_think = 1;
+            else if (req_thinking == 0) g_no_think = 0;
+
             PromptTokens *pt;
             if (is_continuation) {
                 pt = tokenize_continuation_turn(content);
             } else {
                 pt = tokenize_user_turn(content);
             }
+            g_no_think = saved_no_think;
             if (!pt) {
                 http_write_str(client_fd,
                     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
@@ -7236,6 +7273,7 @@ static void print_usage(const char *prog) {
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
+    printf("  --no-think           Disable reasoning entirely (pre-fills an empty <think> block)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
 }
@@ -7273,6 +7311,7 @@ int main(int argc, char **argv) {
             {"2bit",          no_argument,       0, '2'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
+            {"no-think",      no_argument,       0, 'n'},
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
@@ -7281,7 +7320,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Ghn", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -7309,6 +7348,7 @@ int main(int argc, char **argv) {
                     }
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
+                case 'n': g_no_think = 1; break;
                 case 'R': serve_port = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;

@@ -90,9 +90,46 @@ There is no edit or regenerate button. With 30 GatedDeltaNet layers the recurren
 cannot be rewound, so a turn cannot be un-said — New chat is the only reset.
 
 
+## Thinking
+
+The model reasons before answering, and that reasoning streams inline as ordinary content.
+It is often the dominant cost: "Reply with exactly the word OK" spends **73 tokens** thinking
+and 1 answering.
+
+Turn it off with the **Thinking** checkbox in the page, `--no-think` on the server, or
+`"enable_thinking": false` in the request. All three use the mechanism the model's own chat
+template provides (`chat_template.jinja:149`): the generation prompt is pre-filled with an
+already-closed, empty `<think>\n\n</think>\n\n` block, so the model starts on the answer
+instead of opening one.
+
+```bash
+# server default off
+./metal_infer/infer ... --no-think --serve 8000
+
+# or per request (the page always sends this, so the checkbox wins either way)
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"2+2?"}],"max_tokens":64,"enable_thinking":false}'
+```
+
+Measured on "Reply with exactly the word OK and nothing else." at K=4:
+
+| | tokens | output |
+|---|---:|---|
+| thinking on | 73 | `<think>Thinking Process: 1. The user wants…` |
+| thinking off | 1 | `OK` |
+
+Answers stay correct: 391, Canberra, dog and `s[::-1]` all verified with thinking off, at 2-4
+tokens each.
+
+This is **not** the same as `--think-budget N`, which lets the model open a think block and
+then cuts it off mid-thought once the budget is hit. Note also that `--think-budget 0` means
+*unlimited*, not off.
+
 ## What the server ignores
 
-Only `messages[].content`, `max_tokens` / `max_completion_tokens`, and `session_id` are parsed.
+Only `messages[].content`, `max_tokens` / `max_completion_tokens`, `session_id` and
+`enable_thinking` are parsed.
 Everything else in the request is silently dropped: `temperature`, `top_p`, `top_k`, `stop`,
 `n`, `model`, `seed`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `tools`,
 `response_format`. `stream` is ignored too — responses are **always** SSE.
