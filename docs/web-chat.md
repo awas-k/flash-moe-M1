@@ -145,9 +145,14 @@ them.
 
 Reproduced by asking for five emoji: 👍, 🚀, 🔥 and 🎉 each arrived as several chunks
 containing one U+FFFD apiece, while 😊 happened to be a single complete token and survived
-intact. CJK text has been fine in testing — those tokens appear to hold whole characters — but
-that is luck, not correctness. Fixing it means buffering incomplete UTF-8 sequences in
-`sse_send_delta` and flushing only complete characters.
+intact.
+
+**CJK is affected too.** Most Japanese output comes through clean, but not all: in an eval run
+the kanji 犬 was corrupted 32 times in a single reply. So whether a character survives depends
+on how the tokenizer happens to split it, not on the script — do not assume CJK is safe.
+
+Fixing it means buffering incomplete UTF-8 sequences in `sse_send_delta` and flushing only
+complete characters.
 
 
 ## Troubleshooting
