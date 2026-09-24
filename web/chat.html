@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flash-moe chat</title>
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1a1a18; --dim: #6b6b66; --line: #e2e2dd;
+    --card: #ffffff; --user: #eef2f8; --accent: #2f6fb3; --warn: #8a5a00;
+    --err: #a8321e; --think-bg: #f5f5f2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17171a; --fg: #e8e8e4; --dim: #9a9a93; --line: #303036;
+      --card: #1e1e22; --user: #23303f; --accent: #6aa9e0; --warn: #d9a63c;
+      --err: #e2725b; --think-bg: #202026;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    border-bottom: 1px solid var(--line); padding: 10px 16px;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    background: var(--card);
+  }
+  header h1 {
+    font-size: 14px; font-weight: 600; margin: 0 8px 0 0; white-space: nowrap;
+  }
+  header label { font-size: 12px; color: var(--dim); display: flex; gap: 5px; align-items: center; }
+  input, select, button, textarea {
+    font: inherit; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px;
+  }
+  input[type=text] { width: 190px; }
+  input[type=number] { width: 78px; }
+  button { cursor: pointer; background: var(--card); white-space: nowrap; }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
+  #log { flex: 1; overflow-y: auto; padding: 16px; }
+  .msg { max-width: 760px; margin: 0 auto 14px; }
+  .role { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); margin-bottom: 4px; }
+  .body { white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user .body {
+    background: var(--user); padding: 9px 12px; border-radius: 8px;
+  }
+  .msg.err .body { color: var(--err); }
+  .msg.warn .body { color: var(--warn); }
+  details.think {
+    background: var(--think-bg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 10px; margin-bottom: 8px; font-size: 13px;
+  }
+  details.think summary { cursor: pointer; color: var(--dim); font-size: 12px; }
+  details.think .body { color: var(--dim); margin-top: 6px; }
+  .stats { font-size: 11px; color: var(--dim); margin-top: 5px; font-variant-numeric: tabular-nums; }
+  .caret::after {
+    content: "▋"; animation: blink 1.05s steps(1) infinite; color: var(--accent);
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  footer { border-top: 1px solid var(--line); padding: 12px 16px; background: var(--card); }
+  .composer { max-width: 760px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: none; min-height: 40px; max-height: 190px; line-height: 1.5;
+  }
+  .bar { max-width: 760px; margin: 7px auto 0; font-size: 11px; color: var(--dim);
+         display: flex; justify-content: space-between; gap: 12px; }
+  .bar .warn { color: var(--warn); }
+  .bar .err { color: var(--err); }
+  .hint { max-width: 760px; margin: 40px auto; color: var(--dim); }
+  .hint code { background: var(--think-bg); padding: 1px 5px; border-radius: 4px; }
+  @media (max-width: 620px) {
+    header { gap: 7px; } input[type=text] { width: 140px; } header h1 { width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>flash-moe chat</h1>
+  <label>Server
+    <input type="text" id="baseUrl" value="http://127.0.0.1:8000" spellcheck="false">
+  </label>
+  <label>max_tokens
+    <input type="number" id="maxTokens" value="2048" min="1" max="32768">
+  </label>
+  <label>Mode
+    <select id="mode">
+      <option value="continue" selected>Continuation</option>
+      <option value="stateless">Stateless</option>
+    </select>
+  </label>
+  <button id="newChat">New chat</button>
+  <button id="ping">Check server</button>
+</header>
+
+<div id="log">
+  <div class="hint" id="hint">
+    Chat with the local <code>--serve</code> endpoint.
+    <strong>Continuation</strong> sends a stable <code>session_id</code> so the server keeps
+    conversation state in its KV cache; <strong>Stateless</strong> omits it, making every turn
+    independent. One request at a time &mdash; the server is single-threaded.
+  </div>
+</div>
+
+<footer>
+  <div class="composer">
+    <textarea id="input" rows="1" placeholder="Message&hellip;  (Enter to send, Shift+Enter for newline)"></textarea>
+    <button class="primary" id="send">Send</button>
+  </div>
+  <div class="bar">
+    <span id="status">Ready</span>
+    <span id="budget"></span>
+  </div>
+</footer>
+
+<script>
+(() => {
+  "use strict";
+
+  // Effective context is bounded by the GPU KV mirror (~16.8 MB/layer at
+  // kv_heads=2 x head_dim=256 x 4B), not by max_position_embeddings.
+  const CTX_LIMIT = 8192;
+  const CTX_WARN  = 7000;
+
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    baseUrl: $("baseUrl"), maxTokens: $("maxTokens"), mode: $("mode"),
+    newChat: $("newChat"), ping: $("ping"), log: $("log"), hint: $("hint"),
+    input: $("input"), send: $("send"), status: $("status"), budget: $("budget"),
+  };
+
+  let sessionId = crypto.randomUUID();
+  let sessionTokens = 0;       // running estimate for the context guard
+  let streaming = false;
+  let controller = null;
+
+  const base = () => el.baseUrl.value.trim().replace(/\/+$/, "");
+  // Assistant deltas are exactly one token each; user text is only ever an estimate.
+  const estimateTokens = (s) => Math.max(1, Math.ceil(s.length / 3.5));
+
+  function setStatus(text, cls) {
+    el.status.textContent = text;
+    el.status.className = cls || "";
+  }
+
+  function renderBudget() {
+    const over = sessionTokens >= CTX_LIMIT;
+    const near = sessionTokens >= CTX_WARN;
+    el.budget.textContent = `~${sessionTokens} / ${CTX_LIMIT} ctx`;
+    el.budget.className = over ? "err" : near ? "warn" : "";
+    if (over) setStatus("Context full — start a new chat", "err");
+  }
+
+  function addMsg(role, cls) {
+    el.hint?.remove();
+    const wrap = document.createElement("div");
+    wrap.className = "msg " + (cls || role);
+    const r = document.createElement("div");
+    r.className = "role";
+    r.textContent = role;
+    const b = document.createElement("div");
+    b.className = "body";
+    wrap.append(r, b);
+    el.log.append(wrap);
+    el.log.scrollTop = el.log.scrollHeight;
+    return { wrap, body: b };
+  }
+
+  // The server streams reasoning inline as ordinary content; there is no
+  // reasoning_content field. Split it out so the answer reads cleanly.
+  function splitThink(raw) {
+    const open = raw.indexOf("<think>");
+    if (open === -1) return { think: "", answer: raw, thinking: false };
+    const before = raw.slice(0, open);
+    const rest = raw.slice(open + 7);
+    const close = rest.indexOf("</think>");
+    if (close === -1) return { think: rest, answer: before, thinking: true };
+    return { think: rest.slice(0, close), answer: before + rest.slice(close + 8), thinking: false };
+  }
+
+  function renderAssistant(target, raw, streamingNow) {
+    const { think, answer, thinking } = splitThink(raw);
+    target.textContent = "";
+
+    if (think.trim()) {
+      const d = document.createElement("details");
+      d.className = "think";
+      const s = document.createElement("summary");
+      s.textContent = thinking ? "Thinking…" : "Thinking";
+      const tb = document.createElement("div");
+      tb.className = "body";
+      tb.textContent = think.trim();
+      d.append(s, tb);
+      if (thinking) d.open = true;
+      target.append(d);
+    }
+
+    const ans = document.createElement("div");
+    ans.className = "body" + (streamingNow ? " caret" : "");
+    ans.textContent = answer.replace(/^\n+/, "");
+    target.append(ans);
+  }
+
+  function lockUI(busy) {
+    streaming = busy;
+    el.send.disabled = busy;
+    el.ping.disabled = busy;   // never poll the server mid-stream
+    el.mode.disabled = busy;
+    el.baseUrl.disabled = busy;
+    el.send.textContent = busy ? "…" : "Send";
+  }
+
+  async function send() {
+    const text = el.input.value.trim();
+    if (!text || streaming) return;
+
+    if (sessionTokens >= CTX_LIMIT) {
+      setStatus("Context full — press New chat before sending", "err");
+      return;
+    }
+
+    // extract_last_content() finds the LAST "content" key by substring scan, so a
+    // literal "content" inside the message would hijack the parse.
+    if (/"content"/.test(text)) {
+      setStatus('Message contains the literal "content" — server would mis-parse it', "err");
+      return;
+    }
+
+    el.input.value = "";
+    el.input.style.height = "auto";
+    addMsg("you", "user").body.textContent = text;
+    sessionTokens += estimateTokens(text);
+    renderBudget();
+
+    const out = addMsg("assistant");
+    renderAssistant(out.body, "", true);
+
+    const payload = {
+      messages: [{ role: "user", content: text }],
+      max_tokens: Math.max(1, Math.min(32768, Number(el.maxTokens.value) || 2048)),
+      stream: true,
+    };
+    // Continuation mode is what makes multi-turn work: matching session_id keeps
+    // the KV + delta-net state instead of restoring the system-prompt snapshot.
+    if (el.mode.value === "continue") payload.session_id = sessionId;
+
+    lockUI(true);
+    setStatus("Waiting for first token…");
+    controller = new AbortController();
+
+    const t0 = performance.now();
+    let tFirst = null, tokens = 0, raw = "", sawDone = false;
+
+    try {
+      const res = await fetch(base() + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      if (!res.body) throw new Error("no response body");
+
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+
+      outer:
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+
+        // SSE frames are separated by a blank line; the server uses \n\n.
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+
+          for (const line of frame.split("\n")) {
+            if (line.startsWith(":")) continue;          // ": keep-alive"
+            if (!line.startsWith("data: ")) continue;
+            const data = line.slice(6);
+            if (data === "[DONE]") { sawDone = true; break outer; }
+
+            let obj;
+            try { obj = JSON.parse(data); } catch { continue; }
+            const piece = obj?.choices?.[0]?.delta?.content;
+            if (!piece) continue;                         // role chunk has no content
+
+            if (tFirst === null) {
+              tFirst = performance.now();
+              setStatus("Streaming…");
+            }
+            tokens++;
+            raw += piece;
+            renderAssistant(out.body, raw, true);
+            el.log.scrollTop = el.log.scrollHeight;
+          }
+        }
+      }
+
+      renderAssistant(out.body, raw, false);
+
+      if (!sawDone) {
+        const e = addMsg("error", "err");
+        e.body.textContent =
+          "Stream ended without [DONE] — the server closed the connection mid-generation. " +
+          "Check the server terminal.";
+        setStatus("Stream truncated", "err");
+      } else if (tokens >= payload.max_tokens) {
+        // finish_reason is hardcoded "stop" (infer.m:6419) and never "length", so
+        // truncation has to be inferred from hitting the cap exactly.
+        const e = addMsg("truncated", "warn");
+        e.body.textContent =
+          `Stopped at the ${payload.max_tokens}-token cap, so this reply is probably cut off. ` +
+          `The server always reports finish_reason "stop" and cannot tell you this. ` +
+          `Raise max_tokens, or send "Continue." — the session keeps its state.`;
+        setStatus("Hit max_tokens — reply likely truncated", "warn");
+      } else {
+        setStatus("Ready");
+      }
+
+      sessionTokens += tokens;
+      renderBudget();
+
+      if (tokens > 0) {
+        const ttft = (tFirst - t0) / 1000;
+        const decode = (performance.now() - tFirst) / 1000;
+        const s = document.createElement("div");
+        s.className = "stats";
+        s.textContent =
+          `${tokens} tok · TTFT ${ttft.toFixed(2)}s` +
+          (decode > 0 ? ` · ${(tokens / decode).toFixed(2)} tok/s` : "");
+        out.wrap.append(s);
+      }
+
+    } catch (err) {
+      renderAssistant(out.body, raw, false);
+      const e = addMsg("error", "err");
+      if (err.name === "AbortError") {
+        e.body.textContent = "Request aborted.";
+        setStatus("Aborted");
+      } else {
+        // The server's 400/500 replies carry no CORS headers, so the browser
+        // cannot read the status — the real reason is only in its stderr.
+        e.body.textContent =
+          `Request failed (${err.message}). The server's 400/500 replies carry no CORS ` +
+          `headers, so the browser cannot read the status. Check the server terminal ` +
+          `for the actual error.`;
+        setStatus("Request failed", "err");
+      }
+    } finally {
+      controller = null;
+      lockUI(false);
+      el.input.focus();
+    }
+  }
+
+  el.send.addEventListener("click", send);
+
+  el.input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+
+  el.input.addEventListener("input", () => {
+    el.input.style.height = "auto";
+    el.input.style.height = Math.min(190, el.input.scrollHeight) + "px";
+  });
+
+  el.newChat.addEventListener("click", () => {
+    if (controller) controller.abort();   // never leave a socket open
+    sessionId = crypto.randomUUID();
+    sessionTokens = 0;
+    el.log.textContent = "";
+    renderBudget();
+    setStatus("New chat — server will reset to its system-prompt snapshot");
+    el.input.focus();
+  });
+
+  el.ping.addEventListener("click", async () => {
+    if (streaming) return;
+    setStatus("Checking…");
+    try {
+      const r = await fetch(base() + "/health");
+      const j = await r.json();
+      setStatus(`Server ok — model ${j.model || "?"}`);
+    } catch (err) {
+      setStatus(`Server unreachable at ${base()} (${err.message})`, "err");
+    }
+  });
+
+  renderBudget();
+  el.input.focus();
+})();
+</script>
+</body>
+</html>
