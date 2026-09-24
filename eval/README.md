@@ -78,6 +78,15 @@ Adding a prompt means appending one JSONL line — no code change.
 Collected per prompt alongside pass/fail:
 
 - `tok_s`, `ttft_s` — throughput, so the quality cost of a K can be weighed against its speed gain.
+  <br>These are **client-side** counts: one SSE content delta is counted as one token. That
+  matches the server's own count exactly for ordinary text — spot-checked at 7/7, 9/9 and
+  72/72 tokens with identical tok/s — but it under-counts whenever a single character spans
+  several tokens. `sse_send_delta` holds incomplete UTF-8 sequences back and emits the
+  character as one chunk, so a 3-token emoji arrives as one delta. Measured: a four-emoji
+  reply was 17 generated tokens but 9 deltas. The prompt set here is almost entirely
+  single-token text, so the figures are accurate for it; treat tok/s as a lower bound if you
+  add emoji-heavy prompts, and read the server's own `generated=N tokens` log line if you need
+  its count.
 - `hit_cap` — generation stopped at `max_tokens`. Worth knowing because `finish_reason` is
   hardcoded `"stop"` (`infer.m:6419`) and never `"length"`, so the server never reports truncation.
 - `replacement_chars` — count of U+FFFD, which detects the `sse_send_delta` UTF-8 splitting bug
