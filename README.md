@@ -8,10 +8,15 @@ via pure C/Objective-C + Metal shaders, streaming expert weights from SSD.
 
 **Target hardware**: MacBook Pro M1 Pro, 10-core CPU, 14-core GPU, 16 GB unified memory.
 
-**Current baseline** (tg256 kernel, git `089cb24`):
-- K=4: **11.91 tok/s** sustained, **1.71s** TTFT — the recommended profile
-- K=3: **12.77 tok/s** sustained, **1.66s** TTFT — faster, but **quality-degraded**; see
-  [Choosing K](#choosing-k)
+**Current baseline** (git `8a217dd`, 256-token runs, warm page cache):
+- K=4: **11.53 tok/s** sustained, **1.94s** TTFT — the recommended profile
+- K=3: 12.60 tok/s, 1.75s TTFT — faster, but **quality-degraded**; see [Choosing K](#choosing-k)
+
+> These are the best *reproducible* figures: `8a217dd` is the newest commit containing the
+> tg256 change. The 11.91 / 12.77 numbers quoted previously came from an uncommitted tree and
+> do not reproduce from any commit — see [M1 Pro–Specific Optimizations](#m1-prospecific-optimizations).
+> Expect less in real use: sustained chat with a growing context runs ~9.5–10.5 tok/s, since
+> these benchmarks are short generations from an empty context.
 
 **Reference results**:
 - M4 Mac mini 16 GB, K=6: 11.5 tok/s, 2.5s TTFT (tayoun)
@@ -35,8 +40,9 @@ tok/s and TTFT are per-run values (not averaged) unless noted.
 | M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | baseline-sweep | 3 | 11.77 | 1.88s | avg 3 runs, before kernel tuning |
 | M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | baseline-sweep | 4 | 10.93 | 1.98s | avg 3 runs, before kernel tuning |
 | M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | baseline-sweep | 5 | 10.14 | 2.19s | avg 3 runs, before kernel tuning |
-| M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | tg256-expert | 3 | 12.77 | 1.66s | avg 3 runs, tg256 kernel — fastest, but quality-degraded |
-| **M1 Pro MBP (16 GB)** | **Qwen3.5-35B-A3B-4bit** | **tg256-expert** | **4** | **11.91** | **1.71s** | **avg 3 runs, tg256 kernel — recommended profile** |
+| M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | tg256-expert | 3 | 12.77 | 1.66s | avg 3 runs — uncommitted tree; also quality-degraded |
+| M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | tg256-expert | 4 | 11.91 | 1.71s | avg 3 runs — uncommitted tree, does not reproduce |
+| **M1 Pro MBP (16 GB)** | **Qwen3.5-35B-A3B-4bit** | **baseline** | **4** | **11.53** | **1.94s** | **git `8a217dd`, avg 2 runs — recommended profile** |
 
 > New `baseline` run (git `8a217dd`, 2 runs/K): K=3: 12.60 tok/s / 1.75s TTFT, K=4: 11.53 tok/s / 1.94s TTFT, K=5: 10.61 tok/s / 2.13s TTFT, K=6: 9.66 tok/s / 2.44s TTFT
 
@@ -45,13 +51,18 @@ tok/s and TTFT are per-run values (not averaged) unless noted.
 
 | Machine | CPU | GPU cores | Unified Memory | SSD read | Role |
 |---|---|---:|---:|---:|---|
-| MacBook Pro M1 Pro | M1 Pro (10-core) | 14 | 16 GB | ~5.3 GB/s | **This fork — optimization target** |
-| Mac mini M4 | M4 | 10 | 16 GB | ~17.5 GB/s | tayoun reference machine |
+| MacBook Pro M1 Pro | M1 Pro (10-core) | 14 | 16 GB | ~5.3 GB/s (measured) | **This fork — optimization target** |
+| Mac mini M4 | M4 | 10 | 16 GB | not measured | tayoun reference machine |
 | MacBook Pro M3 Max | M3 Max | 40 | 48 GB | — | danveloper original baseline |
 
-> The M1 Pro SSD is ~3.3× slower than the M4, making SSD throughput the primary bottleneck.
-> However, M1 Pro has 1.7× more memory bandwidth (200 GB/s vs 120 GB/s) and 1.4× more GPU cores (14 vs 10),
-> which tg256 kernels exploit effectively.
+> M1 Pro figure measured with `F_NOCACHE` sequential reads over the packed expert files:
+> 5.14–5.34 GB/s single-stream. This README previously claimed the M4 reads at ~17.5 GB/s and
+> that the M1 Pro SSD is therefore 3.3× slower. That figure was never measured here and is not
+> achievable by an NVMe SSD — it exceeds the ~8 GB/s ceiling of PCIe 4.0 ×4 — so the ratio
+> built on it has been removed.
+>
+> M1 Pro does have 1.7× the memory bandwidth of the base M4 (200 vs 120 GB/s) and 1.4× the GPU
+> cores (14 vs 10).
 
 
 ## Architecture
@@ -61,13 +72,56 @@ tok/s and TTFT are per-run values (not averaged) unless noted.
 - Routing **K is runtime-configurable** (`--k`).
 - Per-token SSD I/O at K=4: 4 experts × 1.77 MB × 40 layers ≈ **283 MB/token** from SSD.
 
+### Where the time actually goes
+
+Per-layer breakdown at K=4, from the runtime's own `-T` flag (avg of 3800 layers):
+
+| Phase | ms/layer | share |
+|---|---:|---:|
+| `cmd1_wait` (GPU) | 0.927 | 45% |
+| `expert_io` (SSD) | 0.641 | 31% |
+| `cmd2_wait` (GPU) | 0.435 | 21% |
+| everything else | 0.075 | 4% |
+
+**GPU synchronisation accounts for ~65% of token time; expert I/O for ~31%.** Earlier revisions
+of this README described the SSD as "the primary bottleneck" — measurement does not support
+that. The engine issues 3 command buffers and 2 CPU↔GPU synchronisations per layer, i.e. 120
+buffers and 80 round-trips per token, to move ~34 MB/layer that 200 GB/s should cover in
+~0.17 ms against 1.36 ms observed. The remaining headroom is in launch and synchronisation
+overhead, not in storage.
+
+Reproduce with `-T`:
+
+```bash
+./metal_infer/infer --model models/Qwen3.5-35B-A3B-4bit \
+  --weights metal_infer/out_35b/model_weights.bin \
+  --manifest metal_infer/out_35b/model_weights.json \
+  --vocab metal_infer/vocab.bin --k 4 -t 96 -T -P "your prompt"
+```
+
 ### M1 Pro–Specific Optimizations
 
-- **`tg256` expert matvec kernels**: Threadgroup size 256 better utilizes M1 Pro's 14-core GPU and
-  200 GB/s memory bandwidth. tayoun's `tg128` was tuned for M4 and underperforms on M1 Pro.
+- **`tg256` expert matvec selection** (`beb9e47`): tayoun's `tg128` variant was tuned for M4's
+  10-core GPU and underperforms on M1 Pro, so the selection heuristic that picks it was removed
+  and the pre-existing 256-thread `matvec_v3` is used throughout.
   - CMD2 improvement: −0.082 ms/layer
   - CMD1 improvement: −0.106 ms/layer
-  - Net gain at K=4: +0.98 tok/s vs baseline-sweep (+9%)
+  - Net gain at K=4: **~+0.6 tok/s (+5.5%)** — 10.93 (`089cb24`) → 11.53 (`8a217dd`)
+
+  Two corrections to earlier revisions of this README, both worth knowing before trusting the
+  numbers above:
+
+  1. **No kernel was written.** `beb9e47` changes only 17 lines of `infer.m` and does not touch
+     `shaders.metal`; it deletes the `tg128` selection branch so control falls through to a
+     kernel that already existed. The `dequant_matvec_4bit_v3_tg128` pipeline is still compiled
+     and is now dead code. "tg256 kernels" overstated the change.
+  2. **11.91 tok/s is not reproducible from any commit.** The `tg256-expert` rows in
+     `results.tsv` are stamped `089cb24` — *"license: credit all contributors"*, dated two days
+     **before** tg256 existed — so they were measured on an uncommitted tree and labelled with
+     the then-HEAD SHA. Every sweep after `beb9e47` does contain tg256 and lands K=4 at
+     **11.11–11.58**, never 11.91. The +9% figure compared that unreproducible run against the
+     pre-tg256 baseline; committed-vs-committed the gain is +5.5%, and even that is confounded
+     with the other changes in `beb9e47`.
 
 ### Upstream M4 Optimizations (tayoun)
 

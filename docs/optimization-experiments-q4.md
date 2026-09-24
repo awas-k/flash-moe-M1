@@ -6,7 +6,8 @@ This document tracks four phases:
 
 1. Original M3 Max optimization pass (48GB), culminating at 4.4 tok/s.
 2. M4 16GB port + optimization pass, culminating at 11.5 tok/s and 2.5s TTFT.
-3. M1 Pro 16GB port + optimization pass, culminating at 11.91 tok/s and 1.71s TTFT at K=4.
+3. M1 Pro 16GB port + optimization pass. Best reproducible result is 11.53 tok/s / 1.94s TTFT
+   at K=4 (`8a217dd`); the widely-quoted 11.91 came from an uncommitted tree.
 4. Quality sweep across K (2026-09-24) — the first measurement of what reducing K costs.
    K=4 matches trained top-8 routing at 1.44× the speed; **K=3 is degraded and should not be
    used**. See [K Quality Sweep](#3-k-quality-sweep-2026-09-24).
@@ -17,7 +18,13 @@ This document tracks four phases:
 |---|---|---:|---:|---:|---|
 | Original baseline | M3 Max 48GB | 4 | 4.4 | ~5.6s | First production-quality release |
 | M4 port | M4 16GB | 6 | **11.5** | **2.5s** | 2.6× faster on lower-cost hardware |
-| M1 Pro port | M1 Pro 16GB | 4 | **11.91** | **1.71s** | Exceeds M4 reference on older silicon |
+| M1 Pro port | M1 Pro 16GB | 4 | **11.91** | **1.71s** | See note — not a like-for-like win over M4 |
+
+> The M1 Pro row is K=4 and the M4 row is K=6, so they are not comparable. At **matched K=6**
+> the M1 Pro does 9.66 tok/s against the M4's 11.5 — **16% slower**, not faster. Earlier
+> revisions described this as "exceeds M4 reference on older silicon"; that compared the two
+> at different routing widths. The 11.91 figure is also not reproducible from any commit —
+> see the tg256 provenance note in the README.
 
 ## M3 Max Track (Historical)
 
@@ -32,18 +39,29 @@ Representative kept/discarded experiments from that phase remain relevant for co
 ## M1 Pro 16GB Port: What Changed
 
 The M1 Pro pass started from tayoun's M4-optimized codebase and re-tuned for M1 Pro's
-different hardware characteristics: slower SSD (~5.3 GB/s vs M4's ~17.5 GB/s), higher
-memory bandwidth (200 GB/s vs M4's 120 GB/s), and more GPU cores (14 vs 10).
+different hardware characteristics: 200 GB/s memory bandwidth against the base M4's 120, and
+14 GPU cores against 10. SSD read measures 5.14–5.34 GB/s here (`F_NOCACHE`, sequential,
+single stream).
 
-### 1. `tg256` Expert Matvec Kernels
+> Earlier revisions added "vs M4's ~17.5 GB/s" and treated the SSD as the binding constraint.
+> That M4 figure was never measured and exceeds the ~8 GB/s ceiling of PCIe 4.0 ×4, so it has
+> been dropped. The runtime's own `-T` breakdown puts GPU synchronisation at ~65% of token
+> time and expert I/O at ~31% — see "Where the time actually goes" in the README.
+
+### 1. `tg256` Expert Matvec Selection
 
 tayoun's `tg128` was tuned for M4's 10-core GPU and underperformed on M1 Pro.
-Switching to `tg256` better saturates M1 Pro's 200 GB/s memory bandwidth and
-utilizes its 14 GPU cores more effectively.
+Removing the heuristic that selects it (`beb9e47`) falls through to the pre-existing
+256-thread `matvec_v3`, which better saturates M1 Pro's 200 GB/s and its 14 GPU cores.
 
 - CMD1 improvement: −0.106 ms/layer
 - CMD2 improvement: −0.082 ms/layer
-- Net throughput gain at K=4: +0.98 tok/s (+9% over baseline-sweep)
+- Net throughput gain at K=4: **~+0.6 tok/s (+5.5%)** — 10.93 (`089cb24`) → 11.53 (`8a217dd`)
+
+> No kernel was written: `beb9e47` changes 17 lines of `infer.m` and never touches
+> `shaders.metal`. The earlier "+0.98 tok/s (+9%)" compared against a run measured on an
+> uncommitted tree; committed-vs-committed the gain is +5.5%, and even that is confounded
+> with the other changes in that commit. See the README's provenance note.
 
 **Why not tg512?** At `in_dim=2048`, tg512 gives each thread only 4 loop iterations
 before the reduction phase dominates. Combined with higher synchronization cost and
@@ -56,11 +74,11 @@ M1 Pro's specific core count and bandwidth profile.
 The M4 production default of K=6 is suboptimal on M1 Pro due to its slower SSD.
 Each additional expert adds ~1.77 MB × 40 layers of SSD I/O per token.
 
-- Recommended: `K=4` (11.91 tok/s, 1.71s TTFT) — best quality/speed balance
+- Recommended: `K=4` (11.53 tok/s, 1.94s TTFT at `8a217dd`) — best quality/speed balance
 - Maximum throughput: `K=3` (12.77 tok/s, 1.66s TTFT) — **not recommended**, see the quality
   sweep below; `quality=pass` in `bench.sh` is a liveness check (≥32 non-empty tokens), never
   a quality measurement, so it never supported this
-- K=6 on M1 Pro: 9.66 tok/s — 16% slower than M4 reference due to SSD bottleneck
+- K=6 on M1 Pro: 9.66 tok/s — 16% slower than the M4 reference at the same K
 
 Note that `K` truncates the router's trained top-8 (`num_experts_per_tok: 8` in `config.json`)
 and renormalises (`infer.m:5590`). `cfg.num_experts_per_tok` is parsed but never drives
@@ -90,7 +108,7 @@ elsewhere, and the lowest text agreement with trained routing.
 **K=4, 6 and 8 are indistinguishable**: 24/25/24 of 26 are spreads of a single item. K=4
 therefore matches trained top-8 routing on this set while running **1.44× faster** (10.29 vs
 7.16 tok/s), which supports the existing default rather than overturning it. Note the
-throughput figures are lower than the headline 11.91 because these are 512-token generations;
+throughput figures are lower than the 256-token benchmark because these are 512-token runs;
 the benchmark numbers come from shorter runs with an empty context.
 
 Text agreement with K=8 rises monotonically with K (54% → 58% → 65%) even where both answers
@@ -106,7 +124,8 @@ items separately so they are not charged to a lower K.
 - Model: Qwen3.5-35B-A3B-4bit
 - Hardware: MacBook Pro M1 Pro, 16GB unified memory
 - Routing: `K=4` — matches trained top-8 routing on the 26-prompt eval at 1.44× the speed
-- Performance: 11.91 tok/s sustained, 1.71s TTFT (git `089cb24`)
+- Performance: 11.53 tok/s sustained, 1.94s TTFT (git `8a217dd`) — best reproducible;
+  ~9.5–10.5 tok/s in sustained chat as context grows
 - Stability: no crashes across benchmark runs. (Previously written as "quality=pass across
   all benchmark runs", which overstated it: `bench.sh`'s `quality=pass` only asserts that
   ≥32 non-empty tokens were produced. Quality is measured by `eval/`, not by `bench.sh`.)
