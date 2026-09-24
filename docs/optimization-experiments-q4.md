@@ -8,9 +8,10 @@ This document tracks four phases:
 2. M4 16GB port + optimization pass, culminating at 11.5 tok/s and 2.5s TTFT.
 3. M1 Pro 16GB port + optimization pass. Best reproducible result is 11.53 tok/s / 1.94s TTFT
    at K=4 (`8a217dd`); the widely-quoted 11.91 came from an uncommitted tree.
-4. Quality sweep across K (2026-09-24) — the first measurement of what reducing K costs.
-   K=4 matches trained top-8 routing at 1.44× the speed; **K=3 is degraded and should not be
-   used**. See [K Quality Sweep](#3-k-quality-sweep-2026-09-24).
+4. Quality sweep across K (2026-09-24, K=5 added 2026-09-25) — the first measurement of what
+   reducing K costs. **K=4 and K=5 both match trained top-8 routing**; K=3 is degraded and
+   should not be used; K=6 is strictly dominated by K=5. See
+   [K Quality Sweep](#3-k-quality-sweep-2026-09-24).
 
 ## Results Comparison
 
@@ -74,11 +75,13 @@ M1 Pro's specific core count and bandwidth profile.
 The M4 production default of K=6 is suboptimal on M1 Pro due to its slower SSD.
 Each additional expert adds ~1.77 MB × 40 layers of SSD I/O per token.
 
-- Recommended: `K=4` (11.53 tok/s, 1.94s TTFT at `8a217dd`) — best quality/speed balance
+- Recommended: `K=4` (11.53 tok/s, 1.94s TTFT at `8a217dd`) — fastest safe choice
+- Also defensible: `K=5` — same quality, more margin against the verbosity failure mode
 - Maximum throughput: `K=3` (12.77 tok/s, 1.66s TTFT) — **not recommended**, see the quality
   sweep below; `quality=pass` in `bench.sh` is a liveness check (≥32 non-empty tokens), never
   a quality measurement, so it never supported this
-- K=6 on M1 Pro: 9.66 tok/s — 16% slower than the M4 reference at the same K
+- K=6 on M1 Pro: 9.66 tok/s — 16% slower than the M4 reference at the same K, and
+  strictly dominated by K=5 on quality-per-token (see the sweep below)
 
 Note that `K` truncates the router's trained top-8 (`num_experts_per_tok: 8` in `config.json`)
 and renormalises (`infer.m:5590`). `cfg.num_experts_per_tok` is parsed but never drives
@@ -91,12 +94,13 @@ Run with `eval/sweep.sh` over 26 scored prompts; see `eval/README.md`. Sampling 
 `cpu_argmax` with `temperature`/`top_p`/`seed` parsed nowhere, so output is deterministic and
 any difference between two K values is attributable to K alone.
 
-| K | pass | tok/s | cap hits | U+FFFD | repetition | agreement w/ K=8 |
-|---:|---:|---:|---:|---:|---:|---:|
-| 3 | 23/26 | 11.22 | 6 | 38 | 0.041 | 54% |
-| 4 | 24/26 | 10.29 | 3 | 0 | 0.009 | 58% |
-| 6 | 25/26 | 8.36 | 1 | 0 | 0.000 | 65% |
-| 8 | 24/26 | 7.16 | 2 | 0 | 0.000 | — (reference) |
+| K | pass | tok/s | TTFT | cap hits | U+FFFD | repetition | agreement w/ K=8 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3 | 23/26 | 11.22 | 4.25s | 6 | 38 | 0.041 | 54% |
+| 4 | 24/26 | 10.29 | 4.65s | 3 | 0 | 0.009 | 58% |
+| 5 | 25/26 | 9.36 | 5.17s | 1 | 0 | 0.001 | 65% |
+| 6 | 25/26 | 8.36 | 5.63s | 1 | 0 | 0.000 | 65% |
+| 8 | 24/26 | 7.16 | 6.63s | 2 | 0 | 0.000 | — (reference) |
 
 **K=3 is measurably degraded, and the failure mode is verbosity rather than wrong facts.**
 Both of its regressions are it failing to stop: a one-word translation answered in 370
@@ -105,16 +109,36 @@ drafting process (`*Critique 1:* A bit clunky. Let's refine. *Draft 2:*`). Four 
 metrics agree — double the cap hits, 4.5× the repetition rate, 38 U+FFFD against zero
 elsewhere, and the lowest text agreement with trained routing.
 
-**K=4, 6 and 8 are indistinguishable**: 24/25/24 of 26 are spreads of a single item. K=4
-therefore matches trained top-8 routing on this set while running **1.44× faster** (10.29 vs
-7.16 tok/s), which supports the existing default rather than overturning it. Note the
-throughput figures are lower than the 256-token benchmark because these are 512-token runs;
-the benchmark numbers come from shorter runs with an empty context.
+**K=4 and K=5 both match trained top-8 routing** and are the two defensible choices: K=4 is
+10% faster, K=5 has 3× fewer cap hits and 9× less repetition. The one-item pass difference
+between them (24 vs 25 of 26) is noise by the same standard used to call K=4/6/8
+indistinguishable, so the choice rests on whether throughput or margin matters more.
 
-Text agreement with K=8 rises monotonically with K (54% → 58% → 65%) even where both answers
-grade correct — lower K diverges from trained routing before it starts being wrong.
+**K=6 is strictly dominated by K=5** — identical pass rate, agreement and cap hits, 12%
+slower. Nothing on this hardware justifies it, upstream default or not.
 
-One prompt (`moe-02`, Switch Transformer's expert count) fails at K=4, 6 **and** 8: the model
+Note the throughput figures are lower than the 256-token benchmark because these are
+512-token runs; the benchmark numbers come from shorter runs with an empty context.
+
+### The degradation is a gradient, not just a K=3 cliff
+
+The K=5 run (added 2026-09-25) resolved something the four-way sweep could not. Verbosity
+falls steadily as K rises, and K=3 is simply where it crosses into breaking the output:
+
+| | K=3 | K=4 | K=5 | K=6 | K=8 |
+|---|---:|---:|---:|---:|---:|
+| repetition | 0.041 | 0.009 | 0.001 | 0.000 | 0.000 |
+| cap hits | 6 | 3 | 1 | 1 | 2 |
+
+So K=4 is safe but sits closer to the failure mode than K=5 does — 3× the cap hits and 9× the
+repetition. That is the concrete reason to prefer K=5 if margin matters; it is not visible in
+pass rate alone, and it was invisible until K=5 filled the gap.
+
+Text agreement with K=8 rises with K (54% → 58% → 65%) even where both answers grade correct
+— lower K diverges from trained routing before it starts being wrong — but it **plateaus at
+K=5**, which matches K=6 exactly at 65%.
+
+One prompt (`moe-02`, Switch Transformer's expert count) fails at K=4, 5, 6 **and** 8: the model
 believes it activates two experts per token when the correct answer is one. That is a
 knowledge error at trained routing, not a cost of reducing K, and `compare.py` reports such
 items separately so they are not charged to a lower K.
@@ -123,7 +147,8 @@ items separately so they are not charged to a lower K.
 
 - Model: Qwen3.5-35B-A3B-4bit
 - Hardware: MacBook Pro M1 Pro, 16GB unified memory
-- Routing: `K=4` — matches trained top-8 routing on the 26-prompt eval at 1.44× the speed
+- Routing: `K=4` — matches trained top-8 routing on the 26-prompt eval at 1.44× the speed.
+  `K=5` is the alternative if margin matters more than throughput (1.10× slower, 3× fewer cap hits)
 - Performance: 11.53 tok/s sustained, 1.94s TTFT (git `8a217dd`) — best reproducible;
   ~9.5–10.5 tok/s in sustained chat as context grows
 - Stability: no crashes across benchmark runs. (Previously written as "quality=pass across

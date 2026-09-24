@@ -207,21 +207,31 @@ renormalises, so every K below 8 discards routing mass the model was trained to 
 costs is measured by [`eval/`](eval/README.md) over 26 scored prompts — sampling is greedy and
 deterministic, so differences are attributable to K alone.
 
-| K | eval pass | tok/s | repetition | agreement w/ K=8 | |
-|---:|---:|---:|---:|---:|---|
-| 3 | 23/26 | 11.22 | 0.041 | 54% | **degraded — avoid** |
-| 4 | 24/26 | 10.29 | 0.009 | 58% | **recommended** |
-| 6 | 25/26 | 8.36 | 0.000 | 65% | fine, slower |
-| 8 | 24/26 | 7.16 | 0.000 | — | trained routing, slowest |
+| K | eval pass | tok/s | cap hits | repetition | agreement w/ K=8 | |
+|---:|---:|---:|---:|---:|---:|---|
+| 3 | 23/26 | 11.22 | 6 | 0.041 | 54% | **degraded — avoid** |
+| 4 | 24/26 | 10.29 | 3 | 0.009 | 58% | **fastest safe choice** |
+| 5 | 25/26 | 9.36 | 1 | 0.001 | 65% | **most margin for the price** |
+| 6 | 25/26 | 8.36 | 1 | 0.000 | 65% | superseded by K=5 |
+| 8 | 24/26 | 7.16 | 2 | 0.000 | — | trained routing, slowest |
 
-**K=4 is the sweet spot.** It matches trained top-8 routing (24 vs 24 of 26) at 1.44× the
-speed. K=6 and K=8 are within one item of it — noise on 26 prompts — and cost 19–30% throughput.
+**Use K=4 or K=5.** Both pass everything trained top-8 routing passes. K=4 is 10% faster;
+K=5 has 3× fewer token-cap hits and 9× less repetition. Pick on whether you want throughput
+or margin — the one-item pass difference between them is noise on 26 prompts.
+
+**K=6 is strictly worse than K=5**: identical pass rate, identical agreement with K=8,
+identical cap hits, and 12% slower. There is no configuration on this hardware where K=6 is
+the right choice, upstream default or not.
 
 **K=3 is degraded**, and the failure is verbosity rather than wrong facts: it stops stopping.
 A one-word translation came back as 370 characters; a 2–3 sentence question came back as 1814
-characters with the model's own drafting process left in. It also shows double the token-cap
-hits and 4.5× the repetition rate. The earlier "use K=3 for maximum throughput" advice
-predates this measurement and is withdrawn.
+characters with the model's own drafting process left in. The earlier "use K=3 for maximum
+throughput" advice predates this measurement and is withdrawn.
+
+That failure mode has a gradient behind it, which is the useful part for tuning. Repetition
+runs 0.041 → 0.009 → 0.001 → 0.000 and cap hits 6 → 3 → 1 → 1 across K=3, 4, 5, 6: verbosity
+falls steadily as K rises, and K=3 is the point where it breaks the output. K=4 is safe, but
+it sits closer to that edge than K=5 does.
 
 Re-run it yourself with `./eval/sweep.sh`. Full analysis in
 [`docs/optimization-experiments-q4.md`](docs/optimization-experiments-q4.md).
