@@ -4624,6 +4624,7 @@ static void fused_layer_forward(
     float *normed = s_normed;
     float *residual = s_residual;
     id<MTLCommandBuffer> cmd1 = nil;
+    int defer_cmd1 = 0;   // CMD1 left open so CMD2 can share its command buffer
     int gpu_linear_attn = 0;  // set to 1 if GPU handles entire linear attention pipeline
 
     // Pre-compute linear_layer_idx for GPU linear attention encoding in CMD1
@@ -4652,7 +4653,30 @@ static void fused_layer_forward(
         // Submit CMD1 immediately — GPU runs CMD3(N-1) then CMD1(N) back-to-back.
         if (g_timing_enabled) { t0 = now_ms(); }
 
+        // CMD1/CMD2 merge (linear-attention layers only).
+        //
+        // CMD2 needs `residual`, which today comes from a GPU->CPU->GPU round trip:
+        // finalize_deferred_experts() reads buf_moe_hidden back to CPU `hidden`,
+        // that is copied to `residual`, and `residual` is memcpy'd into
+        // buf_residual. The CPU step in the middle is the only reason CMD1 has to
+        // complete before CMD2 can be encoded. Blitting buf_moe_hidden ->
+        // buf_residual on the GPU removes the dependency, so both can share one
+        // command buffer and one commit+wait.
+        //
+        // Full-attention layers are excluded: they read q/q_gate back to the CPU
+        // after CMD1 and re-upload them, which is a real dependency.
+        // Prediction is excluded because async_pread_start needs CMD1 complete.
+        defer_cmd1 = (can_gpu_linear && !g_pred_enabled &&
+                      g_metal->buf_moe_hidden && g_metal->buf_residual);
+
         cmd1 = [g_metal->queue commandBuffer];
+        if (defer_cmd1) {
+            id<MTLBlitCommandEncoder> blit = [cmd1 blitCommandEncoder];
+            [blit copyFromBuffer:g_metal->buf_moe_hidden sourceOffset:0
+                        toBuffer:g_metal->buf_residual  destinationOffset:0
+                            size:cfg.hidden_dim * sizeof(float)];
+            [blit endEncoding];
+        }
         gpu_encode_batch_matvec(g_metal, cmd1, attn_specs, num_attn_specs);
 
         // GPU linear attention: encode conv1d + normalize + decay/beta + delta-net + gated_norm into CMD1
@@ -4747,20 +4771,23 @@ static void fused_layer_forward(
             gpu_linear_attn = 1;
         }
 
-        [cmd1 commit];
+        if (!defer_cmd1) [cmd1 commit];
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
 
         // Wait for CMD1 (implies CMD3(N-1) also done, since queue is serial)
         if (g_timing_enabled) { t0 = now_ms(); }
-        [cmd1 waitUntilCompleted];
-        if (!gpu_linear_attn) {
-            gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+        if (!defer_cmd1) {
+            [cmd1 waitUntilCompleted];
+            if (!gpu_linear_attn) {
+                gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+            }
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
 
         // Now CMD3(N-1) is done. Read back hidden state from GPU.
         if (g_timing_enabled) { t0 = now_ms(); }
+        if (!defer_cmd1) {
         finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
 
         // Start predicted expert preads AFTER CMD1_wait.
@@ -4776,6 +4803,7 @@ static void fused_layer_forward(
         }
         // Set up residual for CMD2 (residual = hidden before this layer's attention)
         cpu_vec_copy(residual, hidden, cfg.hidden_dim);
+        }  // !defer_cmd1
         if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
 
         // No input_norm needed — CMD3 already computed it into buf_input.
@@ -5369,12 +5397,14 @@ static void fused_layer_forward(
                    oproj_in_dim * sizeof(float));
         }
         // gpu_linear_attn: batch_out[6] already has the result from CMD1 gated_rms_norm
-        // Copy residual into GPU buffer for residual_add kernel
-        memcpy([g_metal->buf_residual contents], residual, cfg.hidden_dim * sizeof(float));
+        // Copy residual into GPU buffer for residual_add kernel.
+        // When merging, the blit at the head of CMD1 already did this on-GPU.
+        if (!defer_cmd1)
+            memcpy([g_metal->buf_residual contents], residual, cfg.hidden_dim * sizeof(float));
 
         attn_out_for_oproj = NULL;
 
-        id<MTLCommandBuffer> cmd_fused = [g_metal->queue commandBuffer];
+        id<MTLCommandBuffer> cmd_fused = defer_cmd1 ? cmd1 : [g_metal->queue commandBuffer];
 
         // ---- GPU attention dispatches (only for full-attn layers with GPU path) ----
         if (gpu_attn_fuse) {
@@ -5550,12 +5580,30 @@ static void fused_layer_forward(
         memcpy(h_mid, [g_metal->buf_h_mid contents], cfg.hidden_dim * sizeof(float));
         // Read h_post from buf_input (needed for expert input)
         memcpy(h_post, [g_metal->buf_input contents], cfg.hidden_dim * sizeof(float));
+        // Merged path: the deferred-expert bookkeeping was postponed until the one
+        // wait. Its readback into `hidden` is redundant here (hidden is replaced by
+        // h_mid on the next line) but it also clears g_deferred, which is required.
+        if (defer_cmd1) finalize_deferred_experts();
         // Update hidden state to h_mid (= residual + o_proj)
         memcpy(hidden, h_mid, cfg.hidden_dim * sizeof(float));
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_wait += t1 - t0; }
 
     } else {
         // ---- Non-fused fallback path ----
+        // Safety net: merging left CMD1 uncommitted on the assumption that the
+        // fused path would adopt it. It did not, so close it here and do the CPU
+        // readback that was skipped, otherwise the buffer leaks and `residual`
+        // is never populated.
+        if (defer_cmd1) {
+            [cmd1 commit];
+            [cmd1 waitUntilCompleted];
+            if (!gpu_linear_attn) {
+                gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+            }
+            finalize_deferred_experts();
+            cpu_vec_copy(residual, hidden, cfg.hidden_dim);
+            defer_cmd1 = 0;
+        }
         // O projection
         if (attn_out_for_oproj && oproj_w && oproj_s && oproj_b) {
             fast_dequant_matvec(oproj_w, oproj_s, oproj_b, attn_out_for_oproj,
