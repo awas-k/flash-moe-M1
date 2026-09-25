@@ -83,7 +83,34 @@ def main():
               f"{sum(r.get('replacement_chars', 0) for r in rows):>8} "
               f"{sum(r.get('rep_rate', 0) for r in rows)/len(rows):>10.3f}")
 
+    # ---- throughput validity ----
+    # With thinking off the answers are a few tokens long, and tok/s over a
+    # 3-token generation measures startup rather than sustained decode.
+    med = {}
+    for k in ks:
+        tk = sorted(r.get("tokens", 0) for r in runs[k].values())
+        med[k] = tk[len(tk) // 2] if tk else 0
+    if any(v < 32 for v in med.values()):
+        print("\n  NOTE: median generation is "
+              f"{min(med.values())}-{max(med.values())} tokens, so the tok/s column above is")
+        print("  startup-dominated and is NOT a throughput benchmark -- it reads well below")
+        print("  what bench.sh measures on the same build. Use bench.sh for throughput; the")
+        print("  value here is only for spotting gross differences between K.")
+
     # ---- truncation check: must come before any quality claim ----
+    leak = {k: [p for p, r in runs[k].items() if r.get("status") == "contaminated"]
+            for k in ks}
+    if any(leak.values()):
+        print("\n" + "!" * 74)
+        print("SUSPECT RUN \u2014 some answers were not graded: generation hit the token cap")
+        print("while thinking was active, so the text may be reasoning that escaped a")
+        print("force-closed <think> rather than an answer. Re-run with THINKING=off (the")
+        print("default) or a larger max_tokens.")
+        for k in ks:
+            if leak[k]:
+                print(f"  K={k}: {len(leak[k])} not graded \u2014 {', '.join(leak[k])}")
+        print("!" * 74)
+
     trunc = {k: [p for p, r in runs[k].items() if r.get("status") == "truncated"]
              for k in ks}
     if any(trunc.values()):

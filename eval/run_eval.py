@@ -41,6 +41,24 @@ def strip_think(text):
     return out.strip(), truncated
 
 
+def reasoning_may_have_leaked(raw, hit_cap):
+    """True when the sample cannot be trusted as an answer.
+
+    The server's --think-budget injects </think> after N reasoning tokens. The
+    model does not know, so it keeps reasoning and the continuation is graded as
+    the answer -- four committed results were passes decided on drafting notes.
+
+    Detected structurally rather than by matching prose: thinking was active
+    (a </think> is present) AND generation hit the token cap. Trying to spot
+    leaked reasoning by how the text opens both missed real cases (Japanese
+    sentence fragments, "(1 文):**") and flagged legitimate bulleted answers.
+    Either way the sample is truncated, so the verdict is unreliable.
+
+    With --no-think there is no think block in the response and this never fires.
+    """
+    return bool(hit_cap and "</think>" in raw)
+
+
 # ---------- graders ----------
 # A prompt passes only if EVERY grader key it declares passes.
 
@@ -241,6 +259,10 @@ def main():
         answer, cut_in_think = strip_think(raw)
         if cut_in_think:
             status, ok, why = "truncated", False, "cap hit while still inside <think>; never answered"
+        elif reasoning_may_have_leaked(raw, stats["hit_cap"]):
+            # Grading this would score the model's own drafting notes.
+            status, ok, why = ("contaminated", False,
+                               "answer is reasoning that escaped a force-closed <think>; not graded")
         else:
             ok, why = grade(answer, it["grade"])
             status = "pass" if ok else "fail"
@@ -250,7 +272,8 @@ def main():
             "answer": answer, "raw": raw, "rep_rate": repetition_rate(answer), **stats,
         })
         flag = "" if not stats["replacement_chars"] else f" U+FFFD×{stats['replacement_chars']}"
-        label = {"pass": "PASS", "fail": "FAIL", "truncated": "TRUNC"}[status]
+        label = {"pass": "PASS", "fail": "FAIL",
+                 "truncated": "TRUNC", "contaminated": "LEAK"}[status]
         print(f"{label}  {stats['tokens']:>4}tok "
               f"{stats['tok_s'] or 0:>5.2f}tok/s{flag}"
               f"{'' if ok else '  <- ' + why[:60]}")
@@ -261,6 +284,7 @@ def main():
 
     passed = sum(1 for r in rows if r["ok"])
     trunc = sum(1 for r in rows if r.get("status") == "truncated")
+    leaked = sum(1 for r in rows if r.get("status") == "contaminated")
     print(f"\nK={args.k}: {passed}/{len(rows)} passed  ->  {outdir / (stem + '.json')}")
     if trunc:
         print(f"  WARNING: {trunc} item(s) never answered — the cap hit during <think>. "

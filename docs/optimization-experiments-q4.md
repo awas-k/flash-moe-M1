@@ -94,31 +94,49 @@ Run with `eval/sweep.sh` over 26 scored prompts; see `eval/README.md`. Sampling 
 `cpu_argmax` with `temperature`/`top_p`/`seed` parsed nowhere, so output is deterministic and
 any difference between two K values is attributable to K alone.
 
-| K | pass | tok/s | TTFT | cap hits | U+FFFD | repetition | agreement w/ K=8 |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 3 | 23/26 | 11.22 | 4.25s | 6 | 38 | 0.041 | 54% |
-| 4 | 24/26 | 10.29 | 4.65s | 3 | 0 | 0.009 | 58% |
-| 5 | 25/26 | 9.36 | 5.17s | 1 | 0 | 0.001 | 65% |
-| 6 | 25/26 | 8.36 | 5.63s | 1 | 0 | 0.000 | 65% |
-| 8 | 24/26 | 7.16 | 6.63s | 2 | 0 | 0.000 | — (reference) |
+| K | pass | tok/s | TTFT | agreement w/ K=8 |
+|---:|---:|---:|---:|---:|
+| 3 | 23/26 | 13.36 | 1.62s | 58% |
+| 4 | 24/26 | 12.22 | 1.81s | 62% |
+| 5 | 25/26 | 11.13 | 2.04s | 69% |
+| 6 | 24/26 | 9.71 | 2.31s | 69% |
+| 8 | 25/26 | 8.28 | 2.88s | — (reference) |
 
-**K=3 is measurably degraded, and the failure mode is verbosity rather than wrong facts.**
-Both of its regressions are it failing to stop: a one-word translation answered in 370
-characters, and a 2-3 sentence question answered in 1814 characters that leaked its own
-drafting process (`*Critique 1:* A bit clunky. Let's refine. *Draft 2:*`). Four independent
-metrics agree — double the cap hits, 4.5× the repetition rate, 38 U+FFFD against zero
-elsewhere, and the lowest text agreement with trained routing.
+Pass rate and agreement from `eval/` at `THINKING=off`; throughput and TTFT from `bench.sh`
+(256 tokens, 2 runs averaged) at `d0a2ddc`, i.e. after the CMD1/CMD2 merge. The eval's own
+tok/s is **not** usable here: with thinking off the median generation is 3 tokens, so that
+figure is startup-dominated and reads ~35% below `bench.sh` on the same build. `compare.py`
+prints a warning when this applies.
 
-**K=4 and K=5 both match trained top-8 routing** and are the two defensible choices: K=4 is
-10% faster, K=5 has 3× fewer cap hits and 9× less repetition. The one-item pass difference
-between them (24 vs 25 of 26) is noise by the same standard used to call K=4/6/8
-indistinguishable, so the choice rests on whether throughput or margin matters more.
+**K=5 matches trained top-8 routing exactly** (25/26, same as K=8) at 1.35× the speed, and is
+the recommendation. K=4 is a further 10% faster and one item behind — within noise on 26
+prompts, so it remains defensible if throughput matters more.
 
-**K=6 is strictly dominated by K=5** — identical pass rate, agreement and cap hits, 12%
-slower. Nothing on this hardware justifies it, upstream default or not.
+**K=6 is strictly worse than K=5**: one fewer pass, identical agreement with K=8, 15% slower.
 
-Note the throughput figures are lower than the 256-token benchmark because these are
-512-token runs; the benchmark numbers come from shorter runs with an empty context.
+**K=3 is degraded, and the failure is verbosity rather than wrong facts.** Asked for one word
+it answered in 301 characters; asked for two words, 326; a 2-3 sentence question drew 2270. It
+is the only K that still hits the token cap, and the only one where the model asserts
+Qwen1.5-110B is an MoE model (it is dense) — an error that also appeared in an early manual
+chat transcript and had not previously reproduced under test.
+
+One prompt (`moe-02`, Switch Transformer's expert count) fails at every K including 8: the
+model believes two experts are activated per token when the answer is one. A knowledge error
+at trained routing, not a cost of reducing K; `compare.py` reports such items separately.
+
+### Thinking is off by default (2026-09-25)
+
+`sweep.sh` now runs with `--no-think`. Measured across all five K values, disabling reasoning
+changed two verdicts in opposite directions (K=6 25→24, K=8 24→25) — noise — while cutting
+total generated tokens by 78% and the median answer from 73 tokens to 3. On a prompt set where
+every item has a verifiable answer, reasoning bought nothing measurable.
+
+It also removed a silent corruption. With thinking on, `--think-budget` force-closes `</think>`
+after N reasoning tokens; the model does not know and keeps reasoning, so the continuation is
+graded as the answer. Thirteen results across the previous sweep were capped thinking
+responses, four of them passes decided on the model's own drafting notes. `run_eval.py` now
+marks any capped response that contains `</think>` as `contaminated` and refuses to grade it,
+and `compare.py` prints a SUSPECT RUN banner. Set `THINKING=on` to restore the old behaviour.
 
 ### The degradation is a gradient, not just a K=3 cliff
 

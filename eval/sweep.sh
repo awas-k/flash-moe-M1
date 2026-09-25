@@ -27,9 +27,18 @@ VOCAB="${VOCAB:-$REPO/metal_infer/vocab.bin}"
 INFER="$REPO/metal_infer/infer"
 OUT="${OUT:-$REPO/eval/results}"
 PORT="${PORT:-8300}"
-# Force </think> after this many reasoning tokens, so reasoning cannot consume
-# the whole max_tokens budget and leave no answer to grade.
+# Thinking is off by default. Measured on this prompt set it changes no verdict
+# and costs 78% more tokens, and leaving it on created a subtle failure: the
+# --think-budget force-closes </think> mid-thought, the model keeps reasoning,
+# and that continuation gets graded as the answer. Set THINKING=on to restore
+# it (THINK_BUDGET then applies).
+THINKING="${THINKING:-off}"
 THINK_BUDGET="${THINK_BUDGET:-384}"
+if [ "$THINKING" = "off" ]; then
+    THINK_ARGS=(--no-think)
+else
+    THINK_ARGS=(-B "$THINK_BUDGET")
+fi
 KS=("$@"); [ ${#KS[@]} -eq 0 ] && KS=(3 4 6 8)
 
 SERVER_PID=""
@@ -50,7 +59,7 @@ mkdir -p "$OUT"
 for K in "${KS[@]}"; do
     echo "=============== K=$K ==============="
     "$INFER" --model "$MODEL_DIR" --weights "$WEIGHTS" --manifest "$MANIFEST" \
-             --vocab "$VOCAB" --k "$K" -B "$THINK_BUDGET" --serve "$PORT" \
+             --vocab "$VOCAB" --k "$K" "${THINK_ARGS[@]}" --serve "$PORT" \
              > "$OUT/k$K.server.log" 2>&1 &
     SERVER_PID=$!
 

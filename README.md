@@ -8,15 +8,15 @@ via pure C/Objective-C + Metal shaders, streaming expert weights from SSD.
 
 **Target hardware**: MacBook Pro M1 Pro, 10-core CPU, 14-core GPU, 16 GB unified memory.
 
-**Current baseline** (git `8a217dd`, 256-token runs, warm page cache):
-- K=4: **11.53 tok/s** sustained, **1.94s** TTFT — the recommended profile
-- K=3: 12.60 tok/s, 1.75s TTFT — faster, but **quality-degraded**; see [Choosing K](#choosing-k)
+**Current baseline** (git `d0a2ddc`, `bench.sh`, 256-token runs, 2 runs averaged):
+- K=5: **11.13 tok/s** sustained, **2.04s** TTFT — the recommended profile
+- K=4: **12.22 tok/s**, 1.81s TTFT — faster, one eval item behind; see [Choosing K](#choosing-k)
+- K=3: 13.36 tok/s, 1.62s TTFT — fastest, but **quality-degraded**; avoid
 
-> These are the best *reproducible* figures: `8a217dd` is the newest commit containing the
-> tg256 change. The 11.91 / 12.77 numbers quoted previously came from an uncommitted tree and
-> do not reproduce from any commit — see [M1 Pro–Specific Optimizations](#m1-prospecific-optimizations).
-> Expect less in real use: sustained chat with a growing context runs ~9.5–10.5 tok/s, since
-> these benchmarks are short generations from an empty context.
+> Earlier revisions quoted 11.91 / 12.77 tok/s. Those came from an uncommitted tree and do
+> not reproduce from any commit — see [M1 Pro–Specific Optimizations](#m1-prospecific-optimizations).
+> Expect less in real use: sustained chat with a growing context runs below these figures,
+> since the benchmark is a short generation from an empty context.
 
 **Reference results**:
 - M4 Mac mini 16 GB, K=6: 11.5 tok/s, 2.5s TTFT (tayoun)
@@ -42,9 +42,12 @@ tok/s and TTFT are per-run values (not averaged) unless noted.
 | M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | baseline-sweep | 5 | 10.14 | 2.19s | avg 3 runs, before kernel tuning |
 | M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | tg256-expert | 3 | 12.77 | 1.66s | avg 3 runs — uncommitted tree; also quality-degraded |
 | M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | tg256-expert | 4 | 11.91 | 1.71s | avg 3 runs — uncommitted tree, does not reproduce |
-| **M1 Pro MBP (16 GB)** | **Qwen3.5-35B-A3B-4bit** | **baseline** | **4** | **11.53** | **1.94s** | **git `8a217dd`, avg 2 runs — recommended profile** |
+| M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | baseline | 4 | 11.53 | 1.94s | git `8a217dd`, avg 2 runs — before CMD1/CMD2 merge |
+| **M1 Pro MBP (16 GB)** | **Qwen3.5-35B-A3B-4bit** | **postmerge** | **5** | **11.13** | **2.04s** | **git `d0a2ddc`, avg 2 runs — recommended profile** |
+| M1 Pro MBP (16 GB) | Qwen3.5-35B-A3B-4bit | postmerge | 4 | 12.22 | 1.81s | git `d0a2ddc`, avg 2 runs |
 
-> New `baseline` run (git `8a217dd`, 2 runs/K): K=3: 12.60 tok/s / 1.75s TTFT, K=4: 11.53 tok/s / 1.94s TTFT, K=5: 10.61 tok/s / 2.13s TTFT, K=6: 9.66 tok/s / 2.44s TTFT
+> Pre-merge (`8a217dd`, 2 runs/K): K=3 12.60, K=4 11.53, K=5 10.61, K=6 9.66 tok/s.
+> Post-merge (`d0a2ddc`, 2 runs/K): K=3 13.36, K=4 12.22, K=5 11.13, K=6 9.71, K=8 8.28 tok/s.
 
 
 ## Hardware
@@ -177,9 +180,11 @@ cd ..
   --serve 8000
 ```
 
-> **M1 Pro recommendation**: `--k 4`. It matches the model's trained top-8 routing on the
-> quality eval while running 1.44× faster. Do **not** use `--k 3` — see [Choosing K](#choosing-k).
-> tayoun's upstream default `--k 6` is optimized for M4 and will be slower on M1 Pro (~9.66 tok/s).
+> **M1 Pro recommendation**: `--k 5`. It matches the model's trained top-8 routing on the
+> quality eval (25/26, same as K=8) while running 1.35× faster. `--k 4` is 10% faster again
+> and one eval item behind. Do **not** use `--k 3` — see [Choosing K](#choosing-k).
+> tayoun's upstream default `--k 6` is optimized for M4 and is both slower (9.71 tok/s) and
+> no better in quality than `--k 5` on this hardware.
 
 ### 6. Smoke test
 
@@ -207,31 +212,32 @@ renormalises, so every K below 8 discards routing mass the model was trained to 
 costs is measured by [`eval/`](eval/README.md) over 26 scored prompts — sampling is greedy and
 deterministic, so differences are attributable to K alone.
 
-| K | eval pass | tok/s | cap hits | repetition | agreement w/ K=8 | |
-|---:|---:|---:|---:|---:|---:|---|
-| 3 | 23/26 | 11.22 | 6 | 0.041 | 54% | **degraded — avoid** |
-| 4 | 24/26 | 10.29 | 3 | 0.009 | 58% | **fastest safe choice** |
-| 5 | 25/26 | 9.36 | 1 | 0.001 | 65% | **most margin for the price** |
-| 6 | 25/26 | 8.36 | 1 | 0.000 | 65% | superseded by K=5 |
-| 8 | 24/26 | 7.16 | 2 | 0.000 | — | trained routing, slowest |
+| K | eval pass | tok/s | TTFT | agreement w/ K=8 | |
+|---:|---:|---:|---:|---:|---|
+| 3 | 23/26 | 13.36 | 1.62s | 58% | **degraded — avoid** |
+| 4 | 24/26 | 12.22 | 1.81s | 62% | fastest safe choice |
+| 5 | 25/26 | 11.13 | 2.04s | 69% | **recommended** |
+| 6 | 24/26 | 9.71 | 2.31s | 69% | superseded by K=5 |
+| 8 | 25/26 | 8.28 | 2.88s | — | trained routing, slowest |
 
-**Use K=4 or K=5.** Both pass everything trained top-8 routing passes. K=4 is 10% faster;
-K=5 has 3× fewer token-cap hits and 9× less repetition. Pick on whether you want throughput
-or margin — the one-item pass difference between them is noise on 26 prompts.
+Pass rate and agreement come from `eval/` (26 prompts, thinking off). Throughput and TTFT
+come from `bench.sh` (256 tokens, 2 runs averaged) — **not** from the eval, whose generations
+are a few tokens long with thinking off and whose tok/s is therefore startup-dominated and
+reads ~35% low. Measured after the CMD1/CMD2 merge (`d0a2ddc`).
 
-**K=6 is strictly worse than K=5**: identical pass rate, identical agreement with K=8,
-identical cap hits, and 12% slower. There is no configuration on this hardware where K=6 is
-the right choice, upstream default or not.
+**K=5 is the pick.** It matches trained top-8 routing exactly (25/26) while running **1.35×
+faster**. K=4 is a further 10% faster and one item behind — fine if you want the speed, and
+the one-item gap is within noise on 26 prompts.
+
+**K=6 is strictly worse than K=5**: one fewer pass, identical agreement with K=8, and 15%
+slower. There is no configuration on this hardware where K=6 is the right choice, upstream
+default or not.
 
 **K=3 is degraded**, and the failure is verbosity rather than wrong facts: it stops stopping.
-A one-word translation came back as 370 characters; a 2–3 sentence question came back as 1814
-characters with the model's own drafting process left in. The earlier "use K=3 for maximum
-throughput" advice predates this measurement and is withdrawn.
-
-That failure mode has a gradient behind it, which is the useful part for tuning. Repetition
-runs 0.041 → 0.009 → 0.001 → 0.000 and cap hits 6 → 3 → 1 → 1 across K=3, 4, 5, 6: verbosity
-falls steadily as K rises, and K=3 is the point where it breaks the output. K=4 is safe, but
-it sits closer to that edge than K=5 does.
+Asked for one word it answered in 301 characters; asked for two words, 326; a 2-3 sentence
+question drew 2270. It is also the only K that still hits the token cap, and the only one
+where the model claims Qwen1.5-110B is an MoE model (it is dense). The earlier "use K=3 for
+maximum throughput" advice predates this measurement and is withdrawn.
 
 Re-run it yourself with `./eval/sweep.sh`. Full analysis in
 [`docs/optimization-experiments-q4.md`](docs/optimization-experiments-q4.md).

@@ -16,8 +16,8 @@ rather than a noisy sample, and it makes any diff between two K values attributa
 ## Run it
 
 ```bash
-# All four K values (3, 4, 6, 8) — ~20 min, one server per K
-./eval/sweep.sh
+# All K values — one server per K, thinking off by default
+./eval/sweep.sh 3 4 5 6 8
 
 # Or a subset
 ./eval/sweep.sh 4 8
@@ -73,11 +73,29 @@ mid-reasoning, and everything after is discarded.
 
 Adding a prompt means appending one JSONL line — no code change.
 
+## Thinking
+
+Runs with `--no-think` by default. Across all five K values, disabling reasoning changed two
+verdicts in opposite directions — noise — while cutting total tokens by 78% and the median
+answer from 73 tokens to 3. On a set where every prompt has a verifiable answer, reasoning
+bought nothing measurable and made the sweep four times slower.
+
+It also removed a silent corruption: with thinking on, `--think-budget` force-closes
+`</think>` mid-thought, the model keeps reasoning, and that continuation gets graded as the
+answer. Thirteen results in an earlier sweep were capped thinking responses, four of them
+passes decided on drafting notes. Any capped response containing `</think>` is now marked
+`contaminated` and not graded.
+
+`THINKING=on ./eval/sweep.sh` restores the old behaviour (`THINK_BUDGET` then applies).
+
 ## Metrics needing no ground truth
 
 Collected per prompt alongside pass/fail:
 
-- `tok_s`, `ttft_s` — throughput, so the quality cost of a K can be weighed against its speed gain.
+- `tok_s`, `ttft_s` — rough throughput. **Not a benchmark.** With thinking off (the default)
+  the median answer is ~3 tokens, so tok/s is startup-dominated and reads ~35% below what
+  `bench.sh` measures on the same build. `compare.py` warns when this applies. Use `bench.sh`
+  for any throughput number you intend to quote.
   <br>These are **client-side** counts: one SSE content delta is counted as one token. That
   matches the server's own count exactly for ordinary text — spot-checked at 7/7, 9/9 and
   72/72 tokens with identical tok/s — but it under-counts whenever a single character spans
