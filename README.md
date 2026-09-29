@@ -1,4 +1,4 @@
-# Flash-MoE on a 16 GB M1 Pro
+# Flash-MoE: Qwen3.5-35B-A3B (4-bit) on a 16 GB M1 Pro
 
 ## Project context
 
