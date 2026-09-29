@@ -1,4 +1,4 @@
-# Flash-MoE M1 Pro Optimization
+# Flash-MoE on a 16 GB M1 Pro
 
 ## Project context
 
